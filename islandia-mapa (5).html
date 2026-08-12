@@ -1,0 +1,1434 @@
+<!DOCTYPE html>
+<html lang="es-AR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#14171c">
+<title>Islandia · 20–28 sep 2026</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Archivo:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --basalt:#14171c; --basalt2:#1b1f26; --basalt3:#232833;
+    --line:#2e3540; --line2:#3c4553;
+    --ink:#e9ecef; --dim:#98a1ad; --dimmer:#6b7482;
+    --signal:#f0c04a; --alert:#e0574b; --ok:#4bbd8b;
+    --d1:#e8b33c; --d2:#e8743b; --d3:#d9524e; --d4:#c05a9e; --d5:#8a6bd1;
+    --d6:#4e86e0; --d7:#2fb6c4; --d8:#3fbf7f; --d9:#a3c93c;
+    --sea:#10141a; --land:#1f252e; --coast:#39424f; --glac:#33404f;
+    --glacline:#5d7186; --road:#4d5866; --reftx:#6f7a88;
+    --disp:'Barlow Condensed',Impact,sans-serif;
+    --body:'Archivo',system-ui,sans-serif;
+    --mono:'IBM Plex Mono',ui-monospace,monospace;
+  }
+  /* ---------- fotos ----------
+   Vienen de Wikipedia / Wikimedia Commons, que tienen licencia libre, y se piden
+   desde el navegador al abrir cada día. No van incrustadas en el archivo: sin red
+   simplemente no aparecen, y el resto del mapa funciona igual.
+   Se pide una tanda por día con los títulos exactos; los que no resuelven caen a
+   una búsqueda por nombre. */
+const PH = {};                       // nombre de parada -> {src, page} | null
+const WAPI = 'https://en.wikipedia.org/w/api.php';
+
+function stopsOf(d){
+  // incluye los alojamientos del día: son el arranque y el cierre del recorrido
+  // y también se navegan con las flechas.
+  const bases = d.route.filter(s => s.base!==undefined).map(s => BASES[s.base]);
+  return d.route.filter(s => s.base===undefined).concat(d.extras || [], bases);
+}
+
+async function wq(params){
+  const u = WAPI + '?' + new URLSearchParams(
+    Object.assign({action:'query', format:'json', origin:'*'}, params));
+  const r = await fetch(u);
+  return r.json();
+}
+
+function harvest(j){
+  const q = j.query || {}, pages = q.pages || {};
+  // Wikipedia devuelve el título final; hay que rastrear normalizaciones y
+  // redirecciones para volver al título que pedimos.
+  const back = {};
+  (q.normalized || []).forEach(x => back[x.to] = x.from);
+  (q.redirects  || []).forEach(x => back[x.to] = back[x.from] || x.from);
+  const out = {};
+  Object.values(pages).forEach(p => {
+    if(!p.thumbnail) return;
+    const rec = {src:p.thumbnail.source,
+      page:'https://en.wikipedia.org/wiki/' + encodeURIComponent(p.title.replace(/ /g,'_'))};
+    out[p.title] = rec;
+    let k = p.title, guard = 0;
+    while(back[k] && guard++ < 5){ k = back[k]; out[k] = rec; }
+  });
+  return out;
+}
+
+async function loadPhotos(d){
+  const stops = stopsOf(d).filter(s => PH[s.name] === undefined);
+  if(!stops.length) return;
+  stops.forEach(s => PH[s.name] = null);          // marca "pedido"
+  const titled = stops.filter(s => s.wiki);
+  try{
+    if(titled.length){
+      const j = await wq({prop:'pageimages', piprop:'thumbnail', pithumbsize:'900',
+                          redirects:'1',
+                          titles: [...new Set(titled.map(s=>s.wiki))].join('|')});
+      const got = harvest(j);
+      titled.forEach(s => { if(got[s.wiki]) PH[s.name] = got[s.wiki]; });
+    }
+    // los que quedaron sin foto: búsqueda por nombre, de a uno y sin bloquear
+    const misses = stops.filter(s => !PH[s.name]).slice(0, 8);
+    await Promise.all(misses.map(async s => {
+      try{
+        const j = await wq({generator:'search', gsrsearch:s.name+' Iceland', gsrlimit:'1',
+                            prop:'pageimages', piprop:'thumbnail', pithumbsize:'900'});
+        const got = Object.values(harvest(j))[0];
+        if(got) PH[s.name] = got;
+      }catch(e){}
+    }));
+  }catch(e){}
+  renderDay(); draw();
+  if(NAVi >= 0) paintSheet();
+}
+
+function photoTag(s, cls){
+  const p = PH[s.name];
+  if(!p) return '';
+  return `<span class="${cls}"><img src="${p.src}" alt="${s.name}" loading="lazy"
+     onerror="this.parentNode.style.display='none'"></span>`;
+}
+
+/* ---------- panel de parada ----------
+   Reemplaza al globo de Leaflet: hay lugar para la foto grande y para el texto
+   completo. NAV es la lista de paradas recorrible con las flechas: sigue el
+   orden del día abierto, o todos los días encadenados si está en «TODO». */
+let NAV = [], NAVi = -1;
+
+function buildNav(){
+  NAV = [];
+  const days = SEL==='all' ? DAYS : [DAYS[SEL]];
+  days.forEach(d => seqOf(d).forEach(s => {
+    // seqOf ya devuelve el orden real del recorrido, con las sugeridas
+    // intercaladas donde corresponde; los alojamientos se repiten entre días,
+    // así que se agregan una sola vez.
+    if(!s.isBase) NAV.push({d, s});
+    else if(!NAV.some(x => x.base && x.s.name===s.name)) NAV.push({d, s, base:true});
+  }));
+}
+
+const $ = id => document.getElementById(id);
+
+function openSheet(dayN, name){
+  buildNav();
+  const i = NAV.findIndex(x => x.s.name===name && (x.d.n===dayN || x.base));
+  if(i < 0) return;
+  NAVi = i; paintSheet(); $('ov').hidden = false;
+  document.body.style.overflow = 'hidden';
+  $('shX').focus();
+}
+function closeSheet(){
+  $('ov').hidden = true; NAVi = -1;
+  document.body.style.overflow = '';
+}
+function stepSheet(dir){
+  if(NAVi < 0) return;
+  const n = NAVi + dir;
+  if(n < 0 || n >= NAV.length) return;
+  NAVi = n; paintSheet();
+}
+
+function paintSheet(){
+  const {d, s, base} = NAV[NAVi];
+  const col = clr(d.n-1);
+  const p = PH[s.name];
+
+  const img = $('shImg');
+  if(p){
+    img.className = 'on';
+    // En los alojamientos la foto es del paraje, no de la cabaña: hay que decirlo.
+    const cap = base && s.area ? `<span class="cap">${s.area} — foto de la zona, no del alojamiento</span>` : '';
+    img.innerHTML = `<img src="${p.src}" alt="${s.name}"
+      onerror="document.getElementById('shImg').className=''">` + cap;
+  }
+  else { img.className = ''; img.innerHTML = ''; }
+
+  $('shDay').innerHTML = base
+    ? `<span class="dot" style="background:var(--ink)"></span>Alojamiento`
+    : `<span class="dot" style="background:${col}"></span>Día ${d.n} · ${d.dow} ${d.date}`;
+  $('shT').textContent = s.name;
+
+  const bits = [];
+  if(base){ bits.push(s.meta); }
+  else{
+    bits.push(s.type);
+    if(s.dur) bits.push(hm(s.dur));
+    if(s.sug) bits.push('sugerido · desvío +' + s.addKm + ' km / +' + s.addMin + ' min');
+    if(s.book) bits.push('a reservar');
+    if(s.approx) bits.push('ubicación aprox.');
+  }
+  $('shMeta').textContent = bits.join(' · ');
+  $('shNote').textContent = s.note || '';
+  $('shTip').textContent = s.tip || '';
+  $('shCount').textContent = (NAVi+1) + ' / ' + NAV.length +
+    (SEL==='all' ? ' · todo el viaje' : ' · día ' + d.n);
+  // addr tiene prioridad: cuando un alojamiento tenga dirección exacta, Google la
+  // resuelve mejor que una coordenada aproximada.
+  $('shMap').href = 'https://www.google.com/maps/search/?api=1&query=' +
+    encodeURIComponent(s.addr ? s.addr : (s.lat + ',' + s.lng));
+  $('shMap').textContent = base && !s.addr ? 'Buscar la zona en Google Maps' : 'Abrir en Google Maps';
+
+  $('shP').disabled = NAVi === 0;
+  $('shN').disabled = NAVi === NAV.length - 1;
+  $('sheet').scrollTop = 0;
+  map.panTo([s.lat, s.lng], {animate:true, duration:.5});
+}
+
+$('shX').onclick = closeSheet;
+$('shP').onclick = () => stepSheet(-1);
+$('shN').onclick = () => stepSheet(1);
+$('ov').addEventListener('click', e => { if(e.target === $('ov')) closeSheet(); });
+document.addEventListener('keydown', e => {
+  if($('ov').hidden) return;
+  if(e.key === 'Escape') closeSheet();
+  if(e.key === 'ArrowLeft') stepSheet(-1);
+  if(e.key === 'ArrowRight') stepSheet(1);
+});
+// deslizar horizontal en el teléfono
+let tx = 0, ty = 0;
+$('sheet').addEventListener('touchstart', e => {
+  tx = e.changedTouches[0].clientX; ty = e.changedTouches[0].clientY;
+}, {passive:true});
+$('sheet').addEventListener('touchend', e => {
+  const dx = e.changedTouches[0].clientX - tx, dy = e.changedTouches[0].clientY - ty;
+  if(Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy)*1.6) stepSheet(dx < 0 ? 1 : -1);
+}, {passive:true});
+
+/* ---------- temas ---------- */
+  html[data-theme="dia"]{
+    --basalt:#f5f2ec; --basalt2:#fffdf8; --basalt3:#e9e5db;
+    --line:#dcd6c9; --line2:#bfb7a6;
+    --ink:#1b2029; --dim:#5a626e; --dimmer:#8a92a0;
+    --signal:#9a6400; --alert:#b53225; --ok:#17795010;
+    --ok:#177950;
+    --d1:#b8860b; --d2:#c2571f; --d3:#b32f2c; --d4:#94357a; --d5:#5c43a8;
+    --d6:#1f5fb8; --d7:#0d7f8e; --d8:#1c8a55; --d9:#6d8f14;
+    --sea:#d8e4ea; --land:#f7f4ec; --coast:#b9b0a0; --glac:#e3eef5;
+    --glacline:#9fb8c9; --road:#a89f8e; --reftx:#7c8391;
+  }
+  html[data-theme="psi"]{
+    --basalt:#12002c; --basalt2:#1d0044; --basalt3:#2b0063;
+    --line:#4a1090; --line2:#7522c8;
+    --ink:#f9e9ff; --dim:#c99bff; --dimmer:#9b6be6;
+    --signal:#ffe600; --alert:#ff2d95; --ok:#00ffc8;
+    --d1:#ffe600; --d2:#ff8a00; --d3:#ff2d95; --d4:#e100ff; --d5:#8b3dff;
+    --d6:#2f6bff; --d7:#00e5ff; --d8:#00ffa3; --d9:#b6ff00;
+    --sea:#07001a; --land:#2a0056; --coast:#a24dff; --glac:#12105e;
+    --glacline:#00e5ff; --road:#ff2d95; --reftx:#c99bff;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  html{background:var(--basalt)}
+  body{font-family:var(--body);background:var(--basalt);color:var(--ink);
+       transition:background .25s,color .25s;
+       -webkit-font-smoothing:antialiased;overflow:hidden}
+  #app{display:grid;grid-template-columns:408px 1fr;height:100%}
+
+  #panel{background:var(--basalt);border-right:1px solid var(--line);
+         overflow-y:auto;overscroll-behavior:contain}
+  #panel::-webkit-scrollbar{width:9px}
+  #panel::-webkit-scrollbar-thumb{background:var(--line2);border-radius:9px}
+  .pad{padding:16px 18px}
+  .hd{border-bottom:1px solid var(--line);background:var(--basalt2)}
+  .hd h1{font-family:var(--disp);font-weight:700;font-size:31px;line-height:.94;
+         letter-spacing:.02em;text-transform:uppercase;margin:0}
+  .hd h1 span{color:var(--dimmer)}
+  .hd .sub{font-family:var(--mono);font-size:10.5px;color:var(--dim);
+           letter-spacing:.06em;margin-top:7px;text-transform:uppercase}
+  .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:11px}
+  .chip{font-family:var(--mono);font-size:9.5px;letter-spacing:.05em;
+        border:1px solid var(--line2);color:var(--dim);padding:3px 7px;
+        border-radius:2px;text-transform:uppercase}
+
+  .sect-t{font-family:var(--disp);font-size:14px;letter-spacing:.14em;
+          text-transform:uppercase;color:var(--dim);font-weight:600;
+          display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+  .sect-t em{font-family:var(--mono);font-style:normal;font-size:9px;
+             letter-spacing:.04em;color:var(--dimmer);text-transform:none}
+  .load{position:relative;height:134px;display:flex;gap:4px;align-items:flex-end;
+        margin-top:18px;padding-bottom:19px}
+  .lcol{flex:1;display:flex;flex-direction:column;justify-content:flex-end;
+        height:100%;cursor:pointer;position:relative;background:none;border:0;padding:0;
+        font-family:inherit}
+  .lcol .bars{display:flex;flex-direction:column;justify-content:flex-end;
+              border-radius:2px 2px 0 0;overflow:hidden;transition:filter .15s;width:100%}
+  .lcol:hover .bars,.lcol:focus-visible .bars{filter:brightness(1.3)}
+  .lcol:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+  .b-act,.b-drv{width:100%}
+  .b-drv{background:var(--line2)}
+  .lcol .lbl{position:absolute;bottom:-18px;left:0;right:0;text-align:center;
+             font-family:var(--mono);font-size:9px;color:var(--dimmer)}
+  .lcol[aria-pressed="true"] .lbl{color:var(--ink);font-weight:600}
+  .lcol[aria-pressed="true"] .bars{box-shadow:0 0 0 1.5px var(--ink)}
+  .thr{position:absolute;left:0;right:0;border-top:1px dashed var(--alert);pointer-events:none}
+  .thr b{position:absolute;right:0;top:-13px;font-family:var(--mono);font-size:8.5px;
+         color:var(--alert);font-weight:500;letter-spacing:.04em;background:var(--basalt);padding:0 3px}
+  .legend{display:flex;gap:13px;font-family:var(--mono);font-size:9px;color:var(--dimmer);margin-top:7px}
+  .rtb{font-family:var(--mono);font-size:9px;letter-spacing:.05em;text-transform:uppercase;
+       color:var(--dimmer);margin-top:9px;padding-top:8px;border-top:1px solid var(--line)}
+  .rt{color:var(--ok);opacity:.85}
+  .legend i{display:inline-block;width:8px;height:8px;margin-right:4px;border-radius:1px;vertical-align:-1px}
+
+  .tabs{display:flex;border-top:1px solid var(--line);border-bottom:1px solid var(--line);
+        background:var(--basalt2)}
+  .tab{flex:1;padding:9px 3px;background:none;border:0;border-right:1px solid var(--line);
+       font-family:var(--mono);font-size:10px;color:var(--dim);cursor:pointer;
+       letter-spacing:.05em;transition:background .12s}
+  .tab:last-child{border-right:0}
+  .tab:hover{background:var(--basalt3);color:var(--ink)}
+  .tab[aria-pressed="true"]{background:var(--basalt3);color:var(--ink);font-weight:600;
+       box-shadow:inset 0 -2px 0 currentColor}
+  .tab:focus-visible{outline:2px solid var(--ink);outline-offset:-2px}
+
+  .dtitle{font-family:var(--disp);font-size:24px;line-height:1.03;font-weight:600;
+          margin:0 0 4px;text-transform:uppercase;letter-spacing:.01em}
+  .ddate{font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.05em;
+         text-transform:uppercase;display:flex;align-items:center;gap:7px}
+  .dot{width:9px;height:9px;border-radius:50%;flex:none}
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);
+         border:1px solid var(--line);margin:14px 0}
+  .stat{background:var(--basalt2);padding:9px 10px}
+  .stat b{font-family:var(--mono);font-size:17px;font-weight:600;display:block;line-height:1.15}
+  .stat span{font-family:var(--mono);font-size:8.5px;color:var(--dimmer);
+             letter-spacing:.07em;text-transform:uppercase}
+  .warn{border-left:2px solid var(--alert);background:rgba(224,87,75,.09);
+        padding:9px 11px;font-size:12px;line-height:1.5;margin:12px 0;color:var(--ink)}
+  .warn strong{font-family:var(--disp);letter-spacing:.09em;text-transform:uppercase;
+               font-size:12.5px;display:block;margin-bottom:3px;color:var(--alert)}
+  .warn.sig{border-left-color:var(--signal);background:rgba(240,192,74,.08)}
+  .warn.sig strong{color:var(--signal)}
+
+  .stop{display:flex;gap:10px;padding:9px 0;border:0;border-bottom:1px solid var(--line);
+        cursor:pointer;background:none;width:100%;text-align:left;font-family:inherit;color:inherit}
+  .stop:hover{background:var(--basalt2)}
+  .stop:focus-visible{outline:2px solid var(--ink);outline-offset:-2px}
+  .stop.ex{padding-left:22px}
+  .pin{width:21px;height:21px;border-radius:50%;flex:none;display:grid;place-items:center;
+       font-family:var(--mono);font-size:9.5px;font-weight:600;color:var(--basalt);margin-top:1px}
+  .pin.base{border-radius:3px;background:var(--ink);color:var(--basalt);font-size:12px}
+  .pin.sug{background:transparent!important;border:1.5px dashed var(--line2);color:var(--dim)}
+  .nm{font-size:13px;font-weight:500;line-height:1.3;display:block}
+  .mt{font-family:var(--mono);font-size:9px;color:var(--dimmer);letter-spacing:.05em;
+      text-transform:uppercase;margin-top:3px;display:block}
+  .nt{font-size:11.5px;color:var(--dim);line-height:1.45;margin-top:4px;display:block}
+  .ph{flex:none;width:78px;height:58px;border-radius:3px;overflow:hidden;margin-top:2px;
+      background:var(--basalt3);border:1px solid var(--line)}
+  .ph img{width:100%;height:100%;object-fit:cover;display:block}
+  html[data-theme="psi"] .ph img{filter:saturate(1.9) hue-rotate(-12deg) contrast(1.12)}
+  .tp{display:block;font-size:11px;line-height:1.45;color:var(--signal);opacity:.92;
+      margin-top:6px;padding-left:9px;border-left:1.5px solid rgba(240,192,74,.35)}
+  .tg{display:inline-block;font-family:var(--mono);font-size:8.5px;padding:1px 5px;
+      border-radius:2px;letter-spacing:.05em;text-transform:uppercase;margin-left:5px;vertical-align:1px}
+  .tg.sug{background:rgba(152,161,173,.14);color:var(--dim);border:1px solid var(--line2)}
+  .tg.res{background:rgba(240,192,74,.13);color:var(--signal);border:1px solid rgba(240,192,74,.4)}
+  .leg-row{font-family:var(--mono);font-size:9.5px;color:var(--dimmer);padding:5px 0 5px 31px;
+           border-bottom:1px solid var(--line);letter-spacing:.03em}
+  .leg-row b{color:var(--dim);font-weight:500}
+
+  .ctrls{display:flex;flex-direction:column;gap:9px;border-top:1px solid var(--line);
+         background:var(--basalt2)}
+  .sw{display:flex;align-items:center;gap:9px;font-size:12px;cursor:pointer;color:var(--dim)}
+  .sw input{appearance:none;width:30px;height:17px;background:var(--line2);border-radius:9px;
+            position:relative;cursor:pointer;flex:none;transition:background .15s;margin:0}
+  .sw input:checked{background:var(--ok)}
+  .sw input::after{content:'';position:absolute;top:2px;left:2px;width:13px;height:13px;
+                   background:var(--basalt);border-radius:50%;transition:transform .15s}
+  .sw input:checked::after{transform:translateX(13px)}
+  .sw input:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+
+  .menu{font-size:11px;line-height:1.5;color:var(--dim);background:var(--basalt2);
+        border:1px solid var(--line);padding:8px 10px;margin:0 0 10px}
+  .note{font-size:11px;line-height:1.55;color:var(--dim)}
+  .note ul{margin:8px 0 0;padding-left:16px} .note li{margin-bottom:6px}
+  .note b{color:var(--ink);font-weight:600}
+  .ft{border-top:1px solid var(--line);background:var(--basalt2)}
+
+  #map{height:100%;width:100%;background:var(--sea)}
+  .ref{font-family:var(--mono);font-size:9.5px;letter-spacing:.09em;text-transform:uppercase;
+       color:var(--reftx);white-space:nowrap;text-shadow:0 1px 3px var(--sea)}
+  .ref::before{content:'';display:inline-block;width:4px;height:4px;border-radius:50%;
+       background:var(--reftx);margin-right:5px;vertical-align:1px}
+  .leaflet-container{font-family:var(--body)}
+  .mk{border-radius:50%;display:grid;place-items:center;font-family:var(--mono);font-size:10px;
+      font-weight:600;color:var(--sea);box-shadow:0 1px 5px rgba(0,0,0,.5)}
+  .mk-base{border-radius:3px;background:var(--ink);color:var(--basalt);font-family:var(--disp);
+      font-size:13px;letter-spacing:.04em;box-shadow:0 1px 6px rgba(0,0,0,.6)}
+  .leaflet-bar a{background:var(--basalt2);color:var(--ink);border-bottom-color:var(--line2)}
+  .leaflet-bar a:hover{background:var(--basalt3);color:var(--ink)}
+  .leaflet-control-attribution{background:rgba(20,23,28,.85)!important;color:var(--dimmer)!important;font-size:9px!important}
+  .leaflet-control-attribution a{color:var(--dim)!important}
+  .leaflet-control-layers{background:var(--basalt2)!important;color:var(--ink);
+      border:1px solid var(--line2)!important;font-size:11.5px}
+
+  /* ---------- teléfono ---------- */
+  #themer{position:fixed;top:10px;right:10px;z-index:1200;display:flex;
+      background:var(--basalt2);border:1px solid var(--line2);border-radius:20px;
+      padding:3px;box-shadow:0 3px 16px rgba(0,0,0,.35)}
+  #themer button{background:none;border:0;cursor:pointer;color:var(--dim);
+      font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;
+      padding:6px 11px;border-radius:16px;touch-action:manipulation;transition:all .18s}
+  #themer button:hover{color:var(--ink)}
+  #themer button[aria-pressed="true"]{background:var(--basalt3);color:var(--ink);font-weight:600}
+  #themer button:focus-visible{outline:2px solid var(--ink);outline-offset:1px}
+  html[data-theme="psi"] #themer{box-shadow:0 0 22px rgba(225,0,255,.45)}
+  html[data-theme="psi"] .dtitle,html[data-theme="psi"] .hd h1{text-shadow:0 0 14px rgba(225,0,255,.5)}
+  @media (max-width:900px){ #themer{top:8px;right:8px} #themer button{padding:7px 10px;font-size:10.5px} }
+  /* ---------- panel de parada ---------- */
+  #ov{position:fixed;inset:0;z-index:2000;background:rgba(8,10,14,.72);
+      backdrop-filter:blur(3px);display:grid;place-items:center;padding:24px}
+  #ov[hidden]{display:none}
+  html[data-theme="dia"] #ov{background:rgba(40,44,52,.55)}
+  html[data-theme="psi"] #ov{background:rgba(18,0,44,.78)}
+  #sheet{position:relative;width:min(680px,100%);max-height:calc(100% - 20px);
+      background:var(--basalt2);border:1px solid var(--line2);border-radius:6px;
+      overflow:hidden auto;overscroll-behavior:contain;
+      box-shadow:0 24px 70px rgba(0,0,0,.6)}
+  html[data-theme="psi"] #sheet{box-shadow:0 0 60px rgba(225,0,255,.45)}
+  #shImg{height:330px;background:var(--basalt3);display:none;position:relative}
+  #shImg.on{display:block}
+  #shImg img{width:100%;height:100%;object-fit:cover;display:block}
+  #shImg .cap{position:absolute;left:0;right:0;bottom:0;z-index:2;padding:7px 24px 9px;
+      font-family:var(--mono);font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;
+      color:var(--dim)}
+  #shImg::after{content:'';position:absolute;inset:auto 0 0 0;height:70px;
+      background:linear-gradient(to top,var(--basalt2),transparent);pointer-events:none}
+  html[data-theme="psi"] #shImg img{filter:saturate(1.9) hue-rotate(-12deg) contrast(1.12)}
+  #shBody{padding:20px 24px 22px}
+  #shDay{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;
+      display:flex;align-items:center;gap:7px;color:var(--dim);margin-bottom:5px}
+  #shT{font-family:var(--disp);font-size:32px;line-height:1.02;font-weight:600;
+      text-transform:uppercase;letter-spacing:.01em;margin:0 0 7px;overflow-wrap:break-word}
+  #shMeta{font-family:var(--mono);font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;
+      color:var(--dimmer);margin-bottom:13px}
+  #shNote{font-size:15px;line-height:1.6;margin:0;color:var(--ink)}
+  #shTip{font-size:14px;line-height:1.55;color:var(--signal);margin:13px 0 0;
+      padding-left:12px;border-left:2px solid rgba(240,192,74,.4)}
+  #shTip:empty{display:none}
+  #shFoot{display:flex;justify-content:space-between;align-items:center;gap:12px;
+      margin-top:18px;padding-top:13px;border-top:1px solid var(--line);
+      font-family:var(--mono);font-size:10px;letter-spacing:.05em;text-transform:uppercase}
+  #shCount{color:var(--dimmer)}
+  #shMap{color:var(--dim);text-decoration:none;border-bottom:1px solid var(--line2);padding-bottom:1px}
+  #shMap:hover{color:var(--ink)}
+  #shX{position:absolute;top:10px;right:10px;z-index:3;width:34px;height:34px;
+      border-radius:50%;border:1px solid var(--line2);background:var(--basalt2);
+      color:var(--ink);font-size:21px;line-height:1;cursor:pointer;
+      display:grid;place-items:center;touch-action:manipulation}
+  #shX:hover{background:var(--basalt3)}
+  .nav{position:absolute;top:50%;transform:translateY(-50%);z-index:3;
+      width:42px;height:42px;border-radius:50%;border:1px solid var(--line2);
+      background:var(--basalt2);color:var(--ink);font-size:26px;line-height:1;
+      cursor:pointer;display:grid;place-items:center;padding-bottom:3px;
+      touch-action:manipulation;transition:background .15s}
+  .nav:hover{background:var(--basalt3)}
+  .nav:disabled{opacity:.3;cursor:default}
+  #shP{left:12px} #shN{right:12px}
+  #shX:focus-visible,.nav:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+  @media (max-width:900px){
+    #ov{padding:0;place-items:end stretch}
+    #sheet{width:100%;max-height:92%;border-radius:14px 14px 0 0;border-bottom:0}
+    #shImg{height:230px}
+    #shBody{padding:17px 18px 22px}
+    #shT{font-size:28px}
+    #shNote{font-size:15px}
+    #shTip{font-size:14px}
+    /* En el teléfono las flechas van abajo, al alcance del pulgar */
+    .nav{top:auto;bottom:14px;transform:none;width:48px;height:48px;
+         box-shadow:0 3px 14px rgba(0,0,0,.4)}
+    #shP{left:14px} #shN{right:14px}
+    #shFoot{flex-direction:column;align-items:flex-start;gap:8px;margin-bottom:52px}
+  }
+  #tomap{display:none}
+  @media (max-width:900px){
+    html,body{height:auto;overflow:visible}
+    body{font-size:15px}
+    /* display:contents deja ordenar cada bloque del panel por separado */
+    #app{display:grid;grid-template-columns:1fr;height:auto}
+    #panel{display:contents}
+    .hd{order:1;border-right:0}
+    .tabs{order:2;position:sticky;top:0;z-index:40;overflow-x:auto;
+          -webkit-overflow-scrolling:touch;scrollbar-width:none;
+          box-shadow:0 6px 18px rgba(10,12,16,.55)}
+    .tabs::-webkit-scrollbar{display:none}
+    #mapwrap{order:3;border-bottom:1px solid var(--line);width:100%}
+    #day{order:4}
+    #loadsec{order:5;border-top:1px solid var(--line)}
+    .ctrls{order:6}
+    .ft{order:7}
+
+    /* Alto fijo en px a propósito: dentro de un iframe que se dimensiona por
+       contenido, dvh/vh colapsan a casi cero y el mapa queda invisible. */
+    #mapwrap{height:440px}
+    #map{height:100%;min-height:440px}
+
+    .pad{padding:15px 16px}
+    .hd{padding-bottom:13px}
+    .hd h1{font-size:27px}
+    .hd .sub{font-size:11px}
+    .chip{font-size:10.5px;padding:4px 8px}
+
+    /* pestañas: pastillas deslizables con fecha, más fáciles de tocar */
+    .tab{flex:0 0 auto;padding:11px 14px;font-size:12px;border-right:1px solid var(--line);
+         display:flex;flex-direction:column;gap:2px;line-height:1.15;min-width:62px;
+         touch-action:manipulation}
+    .tdate{display:block;font-size:9.5px;color:var(--dimmer);letter-spacing:.03em}
+    .tab[aria-pressed="true"] .tdate{color:var(--dim)}
+
+    /* texto legible en pantalla chica */
+    .dtitle{font-size:26px}
+    .ddate{font-size:11px}
+    .stat b{font-size:19px}
+    .stat span{font-size:9.5px}
+    .warn{font-size:13.5px;padding:11px 13px}
+    .warn strong{font-size:13.5px}
+    .nm{font-size:15px}
+    .mt{font-size:10.5px}
+    .nt{font-size:13px}
+    .tp{font-size:12.5px;padding-left:10px}
+    .leg-row{font-size:11px;padding:7px 0 7px 34px}
+    .menu{font-size:12.5px;padding:10px 12px}
+    .note{font-size:12.5px}
+    .note li{margin-bottom:8px}
+    .sw{font-size:13.5px;padding:3px 0}
+    .sw input{width:38px;height:22px}
+    .sw input::after{width:18px;height:18px}
+    .sw input:checked::after{transform:translateX(16px)}
+    .rtb{font-size:10px}
+    .legend{font-size:10px}
+
+    /* objetivos de toque más grandes */
+    .stop{padding:13px 0;touch-action:manipulation}
+    .ph{width:64px;height:50px}
+    .pin{width:24px;height:24px;font-size:11px}
+    .lcol{touch-action:manipulation}
+
+    /* nombres islandeses largos: que corten, no que desborden */
+    .nm,.dtitle,.pop-h{overflow-wrap:break-word}
+
+    #tomap{display:block;position:fixed;right:14px;bottom:16px;z-index:60;
+      background:var(--basalt3);color:var(--ink);border:1px solid var(--line2);
+      border-radius:22px;padding:11px 18px;font-family:var(--disp);font-size:15px;
+      letter-spacing:.1em;text-transform:uppercase;box-shadow:0 4px 18px rgba(10,12,16,.6);
+      opacity:0;pointer-events:none;transition:opacity .2s;touch-action:manipulation}
+    #tomap.on{opacity:1;pointer-events:auto}
+  }
+  @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="panel">
+    <div class="hd pad">
+      <h1>Islandia <span>/ 9 días</span></h1>
+      <div class="sub">Dom 20 → Lun 28 sep 2026 · vuelo 00:20 mar 29</div>
+      <div class="chips">
+        <span class="chip">4 adultos</span><span class="chip">1 pers. de 70</span>
+        <span class="chip">Auto alquilado</span><span class="chip">3 bases · 3+1+4 noches</span>
+      </div>
+    </div>
+
+    <div id="loadsec" class="pad" style="border-bottom:1px solid var(--line)">
+      <div class="sect-t">Carga del día <em>manejo + actividad</em></div>
+      <div class="load" id="load"></div>
+      <div class="legend">
+        <span><i style="background:var(--line2)"></i>manejo</span>
+        <span><i style="background:var(--d6)"></i>actividad</span>
+        <span><i style="background:var(--alert);height:2px;border-radius:0"></i>límite 10 h</span>
+      </div>
+      <div id="rtb" class="rtb">calculando rutas reales…</div>
+    </div>
+
+    <div class="tabs" id="tabs"></div>
+    <div id="day" class="pad"></div>
+
+    <div class="ctrls pad">
+      <label class="sw"><input type="checkbox" id="swSug"> Ver paradas sugeridas cerca del recorrido</label>
+      <label class="sw"><input type="checkbox" id="swRoute" checked> Dibujar tramos entre paradas</label>
+      <label class="sw"><input type="checkbox" id="swBase" checked> Alojamientos siempre visibles</label>
+    </div>
+
+    <div class="ft pad note" id="verify"></div>
+  </aside>
+  <main id="mapwrap"><div id="map"></div></main>
+</div>
+<div id="themer" role="group" aria-label="Color de la interfaz">
+  <button data-t="noche" aria-pressed="true"  title="Modo oscuro">Noche</button>
+  <button data-t="dia"   aria-pressed="false" title="Modo diurno">Día</button>
+  <button data-t="psi"   aria-pressed="false" title="Modo psicodélico">Psico</button>
+</div>
+<button id="tomap" aria-label="Volver al mapa">Mapa</button>
+
+<div id="ov" hidden>
+  <div id="sheet" role="dialog" aria-modal="true" aria-labelledby="shT">
+    <button id="shX" aria-label="Cerrar">&times;</button>
+    <button class="nav" id="shP" aria-label="Parada anterior">&#8249;</button>
+    <button class="nav" id="shN" aria-label="Parada siguiente">&#8250;</button>
+    <div id="shImg"></div>
+    <div id="shBody">
+      <div id="shDay"></div>
+      <h2 id="shT"></h2>
+      <div id="shMeta"></div>
+      <p id="shNote"></p>
+      <p id="shTip"></p>
+      <div id="shFoot"><span id="shCount"></span><a id="shMap" target="_blank" rel="noopener">Abrir en Google Maps</a></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+/* ==========================================================================
+   Itinerario Islandia · 20–28 sep 2026 · 4 adultos.
+   route[] es el plan; extras[] son paradas cercanas opcionales.
+   Los km/min de legs[] son estimados de carretera y sirven de respaldo:
+   al abrir el mapa se reemplazan por los del ruteador (OSRM) si hay red.
+   ========================================================================== */
+
+const cssv = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+let DC = [];
+function readDC(){ DC = ['--d1','--d2','--d3','--d4','--d5','--d6','--d7','--d8','--d9'].map(cssv); }
+readDC();
+const clr = i => DC[i % 9];
+const hm = h => { const m = Math.round(h*60);
+  return m < 60 ? m+' min' : Math.floor(m/60)+' h '+String(m%60).padStart(2,'0'); };
+
+const BASES = [
+  {name:'Hrífunes Nature Park', wiki:'Skaftártunga', area:'Skaftártunga', addr:'Hrífunes Nature Park, Hrífunesvegi, 880 Kirkjubæjarklaustur, Iceland', lat:63.7550, lng:-18.2670, tag:'H', meta:'3 noches · 20–22 sep',
+   note:'Hrífunesvegi, 880 Kirkjubæjarklaustur. En Skaftártunga, a mitad de camino entre Vík y Kirkjubæjarklaustur, con el Mýrdalsjökull al oeste y el Vatnajökull al noreste. Cabaña con cocina equipada, sauna y tina caliente a leña.',
+   tip:'Los supermercados y la nafta más cercanos están en Vík (55 km) y Kirkjubæjarklaustur (30 km). Lejos de toda luz urbana: es de las mejores bases del viaje para auroras.'},
+  {name:'Skálholt Cottages', wiki:'Skálholt', area:'Skálholt', addr:'Skálholt Cottages, 806 Selfoss, Iceland', lat:64.1264, lng:-20.5306, tag:'S', meta:'1 noche · 23 sep',
+   note:'Cabaña de dos dormitorios con tina caliente, dentro del predio del Hotel Skálholt. Skálholt fue sede episcopal y centro de poder de Islandia durante siete siglos; la catedral queda a 350 metros a pie.',
+   tip:'El hotel tiene restaurante, útil porque llegan tarde después de las termas. Geysir a 28 km, Gullfoss a 38 y Þingvellir a 48: queda en el centro del Círculo Dorado.'},
+  {name:'Base Snæfellsnes', wiki:'Grundarfjörður', area:'Grundarfjörður', lat:64.9219, lng:-23.2536, tag:'N', meta:'4 noches · 24–27 sep',
+   note:'Airbnb reservado del 24 al 28 de septiembre para los cuatro, en la zona de Grundarfjörður y Stykkishólmur. Desde acá todos los puntos de la península quedan a menos de una hora.',
+   tip:'Kirkjufell está a 5 minutos, así que se puede ir al atardecer y volver a cenar sin manejar de noche. Poca contaminación lumínica para las auroras.'}
+];
+
+/* route[] = recorrido del documento. legs[i] = tramo desde route[i-1] hasta route[i].
+   extras[] = paradas sugeridas por mí, con el costo de desvío que agregan al día. */
+const DAYS = [
+{ n:1, dow:'Dom', date:'20 sep', title:'Llegada y traslado largo', sun:'07:02 – 19:24',
+  route:[
+    {name:'Aeropuerto de Keflavík (KEF)', wiki:'Keflavík International Airport', lat:63.9850, lng:-22.6056, type:'logística', dur:0.75,
+     note:'El aeropuerto está en Reykjanes, a 50 km de Reikiavik, así que la ruta 1 hacia el sur empieza sin pasar por la ciudad. Los mostradores de alquiler están en el edificio de al lado del terminal.',
+     tip:'Sacá fotos del auto antes de salir del predio: en Islandia los daños por piedras y por viento en las puertas son el reclamo más común.'},
+    {name:'Supermercado en Selfoss', lat:63.9333, lng:-20.9971, type:'logística', dur:0.5, approx:true,
+     note:'Selfoss es el último pueblo grande antes de la costa sur y tiene Bónus y Krónan. Es la parada natural para la compra grande… si llegaran de día.',
+     tip:'Van a llegar cerca de las 19:00 de un domingo: dalo por cerrado y resolvé la cena en otro lado.'},
+    {base:0}],
+  legs:[null,{km:85,min:65},{km:185,min:135}],
+  extras:[
+    {name:'Hveragerði', wiki:'Hveragerði', lat:64.0000, lng:-21.1900, type:'logística', dur:0.5, after:0,
+     addKm:4, addMin:6, note:'Pueblo geotérmico a 45 min del aeropuerto, con vapor saliendo del suelo entre las casas. Tiene supermercado y es la primera oportunidad real de comprar algo.',
+     tip:'Si salen de KEF antes de las 18:00, es la única chance de llegar a un súper abierto.'},
+    {name:'N1 Vík', lat:63.4186, lng:-19.0059, type:'logística', dur:0.5, after:1,
+     addKm:2, addMin:4, note:'Estación de servicio con comida caliente en Vík, a 55 km de la cabaña. Cierra bastante más tarde que los supermercados.',
+     tip:'Plan de rescate para la cena del día 1. Cargá nafta también: entre Vík y Kirkjubæjarklaustur no hay mucho.'}],
+  flags:[{t:'sig',h:'Llegan de noche y con el súper cerrado',b:'Aterrizan 17:00 y salen de KEF cerca de las 18:00, así que llegan a la cabaña pasadas las 21:00, con el sol puesto desde las 19:24: dos horas por la ruta 1 a oscuras después del vuelo. Los Bónus y Krónan cierran entre 18:00 y 19:00, y los domingos antes, así que la cena de esta noche sale de una estación N1 o un 10-11. La compra grande va el lunes en Vík, que queda sobre el recorrido del día 2.'}]},
+
+{ n:2, dow:'Lun', date:'21 sep', title:'Cascadas y arena negra', sun:'07:05 – 19:20',
+  route:[
+    {base:0},
+    {name:'Seljalandsfoss', wiki:'Seljalandsfoss', lat:63.6156, lng:-19.9886, type:'naturaleza', dur:1,
+     note:'Cae 60 metros desde lo que fue la línea de costa hace miles de años, y el retroceso del acantilado dejó una cueva detrás de la cortina de agua. Por eso se puede rodear caminando: es de las pocas del mundo donde se ve la cascada desde atrás.',
+     tip:'Estacionamiento pago (~1.000 ISK, app Parka o checkit.is). El sendero de atrás es de piedra mojada y resbala: impermeable de verdad, no campera de abrigo, y calzado con agarre. Quien no quiera dar la vuelta ve igual de bien desde el frente, a 350 m del auto por camino plano.'},
+    {name:'Skógafoss', wiki:'Skógafoss', lat:63.5321, lng:-19.5114, type:'naturaleza', dur:1,
+     note:'25 metros de ancho y 60 de alto, con tanto rocío que hace arcoíris cuando pega el sol. Se puede caminar hasta la base, sobre canto rodado.',
+     tip:'Estacionamiento pago desde 2025 (~1.000 ISK). Los 370 escalones al mirador de arriba son opcionales: desde abajo la cascada impacta más. Arriba arranca el trekking de Fimmvörðuháls, que no es para este viaje.'},
+    {name:'Kvernufoss', wiki:'Kvernufoss', lat:63.5296, lng:-19.4860, type:'caminata', dur:1,
+     note:'La versión tranquila de Seljalandsfoss: también se pasa por detrás del agua, pero escondida en un cañadón y con una fracción de la gente. Se llega por un sendero de 15 minutos que sale desde atrás del museo de Skógar.',
+     tip:'Se estaciona en el museo (~750 ISK, Parka) y eso da acceso a los baños. El sendero cruza un arroyo y tiene tramos de barro.'},
+    {name:'Dyrhólaey', wiki:'Dyrhólaey', lat:63.4014, lng:-19.1259, type:'naturaleza', dur:1,
+     note:'Un promontorio de 120 m con un arco de roca que el mar perforó, y el punto más al sur de la isla continental. Desde arriba se ve toda la costa negra hacia los dos lados.',
+     tip:'Hay dos estacionamientos: el de abajo es fácil, el de arriba se llega por un camino corto pero empinado. Cierra por viento sin aviso, y el portón lo bajan sin discusión: chequeá umferdin.is antes de subir.'},
+    {name:'Reynisfjara', wiki:'Reynisfjara', lat:63.4033, lng:-19.0447, type:'naturaleza', dur:1,
+     note:'Arena negra, columnas de basalto hexagonal apiladas como un órgano de iglesia, y los farallones de Reynisdrangar saliendo del mar. Es la playa más fotografiada de Islandia y también la más peligrosa.',
+     tip:'Las olas sneaker suben decenas de metros sin aviso y han matado turistas. Hay un semáforo de riesgo en la entrada: miralo. Nunca de espaldas al mar, nunca cerca de la orilla, y no dejes que nadie se aleje solo. Estacionamiento pago.'},
+    {name:'Vík', wiki:'Vík í Mýrdal', lat:63.4187, lng:-19.0060, type:'pueblo', dur:0.5,
+     note:'Pueblo de 300 habitantes con la iglesia roja sobre la loma, el único punto de servicios entre Skógar y Kirkjubæjarklaustur.',
+     tip:'Acá hacé la compra grande que quedó pendiente del domingo. Krónan cierra temprano: llegá antes de las 18:00. También hay nafta y baños.'},
+    {base:0}],
+  legs:[null,{km:120,min:95},{km:30,min:25},{km:3,min:6},{km:33,min:30},{km:17,min:20},{km:8,min:10},{km:55,min:45}],
+  extras:[
+    {name:'Gljúfrabúi', wiki:'Gljúfrabúi', lat:63.6209, lng:-19.9861, type:'caminata', dur:0.5, after:1,
+     addKm:1, addMin:3, note:'A 500 metros a pie de Seljalandsfoss, escondida adentro de una grieta: hay que meterse por la hendidura pisando el arroyo para verla caer dentro de una cámara de roca con luz cenital. Mucha gente pasa de largo sin saber que está.',
+     tip:'Te mojás los pies sí o sí. Botas impermeables o directamente asumirlo. La entrada es angosta y resbalosa.'},
+    {name:'Sólheimajökull', wiki:'Sólheimajökull', lat:63.5300, lng:-19.3700, type:'caminata', dur:1.5, after:3,
+     addKm:12, addMin:20, note:'Una lengua del casquete de Mýrdalsjökull que baja hasta una laguna con témpanos. Es el glaciar más accesible de la costa sur: 15–20 minutos de sendero llano desde el estacionamiento hasta el frente de hielo.',
+     tip:'La mejor relación esfuerzo/impacto del día para el grupo. Se llega por 4 km de ripio desde la ruta 1. No pisar el hielo sin guía.'},
+    {name:'Museo de Skógar', wiki:'Skógar', lat:63.5290, lng:-19.5130, type:'museo', dur:1.5, after:3,
+     addKm:1, addMin:3, note:'Casas de turba originales, un barco de pesca, herramientas y objetos de la vida rural islandesa. Es de los museos regionales mejor armados del país y queda en el mismo estacionamiento que Kvernufoss.',
+     tip:'Buen plan si el día está feo. Con lluvia fuerte reemplaza bien una parada al aire libre.'},
+    {name:'Avión DC-3 de Sólheimasandur', wiki:'Sólheimasandur', lat:63.4591, lng:-19.3646, type:'caminata', dur:2.5, after:3,
+     addKm:8, addMin:12, note:'El fuselaje de un avión de la marina estadounidense que aterrizó de emergencia en 1973, tirado en medio de un desierto de arena negra.',
+     tip:'Son 4 km de ida y 4 de vuelta sobre arena, sin sombra ni reparo del viento, y no se ve nada hasta el final. Con el día ya en 9 h 20, es el candidato natural a quedar afuera.'}],
+  flags:[{t:'sig',h:'Salir temprano',b:'Seljalandsfoss está a 120 km de la cabaña, así que la primera cascada llega recién hora y media después de arrancar. El día suma 9 h 20 contra 12 h de luz: entra bien si salen a las 8, pero no da para estirar las paradas. Dejá Vík para el final, con el supermercado antes de las 18:00.'}]},
+
+{ n:3, dow:'Mar', date:'22 sep', title:'Skaftafell y la laguna glaciar', sun:'07:08 – 19:16',
+  route:[
+    {base:0},
+    {name:'Skaftafell · Svartifoss', wiki:'Svartifoss', lat:64.0166, lng:-16.9662, type:'caminata', dur:3,
+     note:'Skaftafell es la parte accesible del Vatnajökull, el glaciar más grande de Europa, y funciona como un oasis: bosque de abedules y praderas entre lenguas de hielo. Svartifoss cae sobre un anfiteatro de columnas de basalto negro que inspiraron el techo de la iglesia Hallgrímskirkja de Reikiavik.',
+     tip:'Ida y vuelta ~5,5 km, 1,5–2 h. La subida es sostenida al principio y después afloja; el sendero está bien marcado y tiene bancos. Hay centro de visitantes con baños y café. Estacionamiento pago.'},
+    {name:'Jökulsárlón', wiki:'Jökulsárlón', lat:64.0784, lng:-16.2306, type:'naturaleza', dur:1,
+     note:'Una laguna que no existía hace un siglo: se formó cuando el glaciar Breiðamerkurjökull empezó a retroceder. Los témpanos se desprenden, flotan azules y translúcidos, y salen al mar por un canal corto. Suele haber focas.',
+     tip:'El mirador está a metros del estacionamiento, sin exigencia física. Hay salidas en bote anfibio que se reservan aparte. Estacionamiento pago.'},
+    {name:'Playa de los Diamantes', wiki:'Breiðamerkursandur', lat:64.0434, lng:-16.1785, type:'naturaleza', dur:0.75,
+     note:'Los témpanos que salieron al mar vuelven a la costa con la marea y quedan varados sobre arena negra, pulidos como vidrio. Cambia todos los días.',
+     tip:'Cruzando la ruta 1 desde la laguna. Las olas también entran fuerte acá: no subirse a los témpanos ni acercarse a la rompiente.'},
+    {base:0}],
+  legs:[null,{km:70,min:50},{km:57,min:45},{km:4,min:5},{km:125,min:95}],
+  extras:[
+    {name:'Fjaðrárgljúfur', wiki:'Fjaðrárgljúfur', lat:63.7714, lng:-18.1721, type:'caminata', dur:1, after:0,
+     addKm:14, addMin:18, note:'Un cañón de 100 m de profundidad y 2 km de largo, con paredes de musgo que serpentean. Se recorre por un sendero de borde con miradores escalonados.',
+     tip:'A media hora de la cabaña y casi sobre la ruta: es el desvío más barato del viaje. Estacionamiento pago. El sendero cierra cuando el suelo está muy blando.'},
+    {name:'Fjallsárlón', wiki:'Fjallsárlón', lat:63.9880, lng:-16.3800, type:'naturaleza', dur:0.75, after:1,
+     addKm:4, addMin:6, note:'La laguna glaciar chica, 10 km antes de Jökulsárlón. Tiene menos témpanos pero el frente del glaciar se ve mucho más cerca, y va la décima parte de la gente.',
+     tip:'Si Jökulsárlón está lleno de micros, esta compensa. En 2026 el estacionamiento seguía siendo gratis.'},
+    {name:'Svínafellsjökull', wiki:'Svínafellsjökull', lat:63.9850, lng:-16.8760, type:'naturaleza', dur:0.75, after:0,
+     addKm:10, addMin:20, note:'Un mirador a pocos minutos de Skaftafell sobre una lengua glaciar agrietada y sucia de ceniza, con un aspecto mucho más crudo que el hielo turístico.',
+     tip:'Se llega por ripio corto. El acceso estuvo restringido en distintos momentos por riesgo de desprendimientos en la ladera: verificá el estado antes de ir.'},
+    {name:'Kirkjubæjarklaustur y Systrafoss', wiki:'Kirkjubæjarklaustur', lat:63.7860, lng:-18.0620, type:'pueblo', dur:0.75, after:0,
+     addKm:20, addMin:20, note:'El pueblo de referencia de la zona, con la cascada Systrafoss cayendo justo detrás de las casas y el Kirkjugólf, un "piso de iglesia" de columnas de basalto pulidas por el hielo que parece hecho a mano pero es natural.',
+     tip:'El súper y la nafta más cercanos a la cabaña. Buena parada para reponer si el lunes en Vík no alcanzó.'}],
+  flags:[{t:'sig',h:'El día más holgado del sur',b:'Skaftafell queda a 70 km de la cabaña y el día cierra en 8 h, así que hay margen real para el clima y para caminar sin apuro. Si el pronóstico da bien, es el día para sumar Fjaðrárgljúfur o Fjallsárlón sin que moleste.'}]},
+
+{ n:4, dow:'Mié', date:'23 sep', title:'Círculo Dorado y noche en Skálholt', sun:'07:11 – 19:12',
+  route:[
+    {base:0},
+    {name:'Geysir · Strokkur', wiki:'Strokkur', lat:64.3104, lng:-20.3024, type:'naturaleza', dur:1,
+     note:'El Geysir original —el que le dio nombre a todos los géiseres del mundo— hoy casi no entra en erupción. El que trabaja es Strokkur, al lado: infla una burbuja azul y dispara 20–30 metros cada 5 a 10 minutos, sin fallar.',
+     tip:'Senderos cortos y planos, apto para todos. Poné el viento a tu espalda antes de la erupción: el agua sale a 100 °C. Hay centro de visitantes con baños y comida.'},
+    {name:'Gullfoss', wiki:'Gullfoss', lat:64.3271, lng:-20.1199, type:'naturaleza', dur:1,
+     note:'El río Hvítá, alimentado por el glaciar Langjökull, cae en dos escalones dentro de un cañón de 70 m. En los años 20 casi la usan para una hidroeléctrica y la salvó la hija del dueño de la tierra amenazando con tirarse.',
+     tip:'El mirador de arriba se llega sin escaleras y ya muestra los dos saltos. La pasarela de abajo tiene escalones y te empapa. Era de los pocos sitios grandes con estacionamiento todavía gratis en 2026.'},
+    {name:'Secret Lagoon (Flúðir)', lat:64.1373, lng:-20.3106, type:'termas', dur:2.5, book:true,
+     note:'La pileta termal más antigua del país, de 1891, cuando se usaba para enseñar a nadar a los chicos del pueblo. Agua entre 38 y 40 °C, fondo natural, vapor por todos lados y un mini géiser que descarga cada pocos minutos al costado.',
+     tip:'Reserva online obligatoria. Es norma estricta ducharse desnudo en el vestuario antes de entrar; no es opcional y está señalizado. Llevá toalla o alquilala.'},
+    {base:1}],
+  legs:[null,{km:235,min:170},{km:10,min:10},{km:45,min:40},{km:22,min:20}],
+  extras:[
+    {name:'Kerið', wiki:'Kerið', lat:64.0411, lng:-20.8853, type:'naturaleza', dur:0.5, after:0,
+     addKm:6, addMin:8, note:'Un cráter volcánico de 3.000 años con las paredes rojas y un lago verde opaco en el fondo. Se puede rodear por el borde o bajar por escalones hasta el agua.',
+     tip:'Sobre la ruta 35 camino a Geysir. Cobra entrada por persona, no por auto. La vuelta completa por arriba son 15 minutos planos.'},
+    {name:'Cascada Faxi', wiki:'Faxi', lat:64.2340, lng:-20.3320, type:'naturaleza', dur:0.5, after:0,
+     addKm:6, addMin:8, note:'Una cascada ancha y baja sobre el río Tungufljót, con una escalera para salmones al costado. Nadie para acá y está a diez minutos de Geysir.',
+     tip:'Parada de 20 minutos, con mesas de picnic. Buena para la vianda del mediodía.'},
+    {name:'Friðheimar', lat:64.1600, lng:-20.2400, type:'comida', dur:1.5, after:2,
+     addKm:10, addMin:12, note:'Un invernadero geotérmico donde se almuerza entre las plantas de tomate, con luces de crecimiento encendidas y abejorros dando vueltas. La sopa de tomate con pan casero es lo que va todo el mundo a comer.',
+     tip:'Hay que reservar con anticipación, se llena. Está a 10 km de Skálholt y encaja con el horario islandés de almuerzo, entre 11:30 y 14:00.'},
+    {name:'Catedral de Skálholt', wiki:'Skálholt', lat:64.1258, lng:-20.5283, type:'museo', dur:0.75, after:3,
+     addKm:1, addMin:2, note:'La iglesia que marca uno de los lugares más cargados de historia de Islandia: acá funcionó la sede episcopal desde 1056 y fue el centro cultural del país hasta que un terremoto la arrasó en 1784. Abajo hay una cripta con el sarcófago de piedra de un obispo del siglo XIII y un túnel medieval excavado.',
+     tip:'A 350 metros a pie de la cabaña: se puede ver a la mañana antes de arrancar, sin gastar tiempo de ruta.'}],
+  flags:[{t:'sig',h:'El turno de las termas ordena el día',b:'Son 235 km hasta Geysir, así que el Círculo Dorado arranca casi tres horas después de dejar Hrífunes: la salida tiene que ser temprano. Reservá Secret Lagoon a las 16:00 o 17:00 y el día cierra solo, porque de Flúðir a Skálholt hay 20 minutos.'}]},
+
+{ n:5, dow:'Jue', date:'24 sep', title:'Þingvellir y transición al norte', sun:'07:14 – 19:09',
+  route:[
+    {base:1},
+    {name:'Þingvellir', wiki:'Þingvellir', lat:64.2559, lng:-21.1300, type:'caminata', dur:2,
+     note:'Acá funcionó el Alþingi desde el año 930: el parlamento en funciones más antiguo del mundo, al aire libre, en una grieta que amplifica la voz. Y es el único lugar del planeta donde se camina por el borde visible entre las placas de Norteamérica y Eurasia, que se separan unos 2 cm por año.',
+     tip:'El sendero Almannagjá baja suave y está pavimentado. Estacionamiento pago (~1.000 ISK, checkit.is) y los baños se cobran aparte. A 48 km de Skálholt: conviene salir temprano porque el día es largo.'},
+    {name:'Hvammsvík Hot Springs', lat:64.3417, lng:-21.5806, type:'termas', dur:3, book:true,
+     note:'Ocho piletas de piedra construidas sobre la costa misma del fiordo de Hvalfjörður, con temperaturas distintas y montañas alrededor. Las de abajo se llenan y vacían con la marea del Atlántico, así que la experiencia cambia según la hora.',
+     tip:'Cupos deliberadamente limitados para que no se llene. Vestuarios modernos y acceso al agua cómodo, que es justo lo que buscaban para el grupo.'},
+    {name:'Ytri Tunga', lat:64.8035, lng:-22.9155, type:'naturaleza', dur:0.75,
+     note:'Una playa de arena dorada —rareza en esta isla— donde una colonia de focas se tira sobre las rocas a descansar. Es de los lugares más confiables de Islandia para verlas sin salir en barco.',
+     tip:'Está sobre la ruta 54, no es desvío. Mejor con marea baja. Prismáticos ayudan, y hay que quedarse lejos: molestarlas está prohibido.'},
+    {base:2}],
+  legs:[null,{km:48,min:45},{km:58,min:50},{km:148,min:110},{km:62,min:50}],
+  extras:[
+    {name:'Öxarárfoss', wiki:'Öxarárfoss', lat:64.2650, lng:-21.1220, type:'caminata', dur:0.5, after:1,
+     addKm:1, addMin:2, note:'La cascada de adentro de Þingvellir, al final de la grieta de Almannagjá. Se llega por pasarela de madera desde el mismo sendero.',
+     tip:'Está incluida en la caminata: 15 minutos más y no hay que pagar otro estacionamiento.'},
+    {name:'Borgarnes', wiki:'Borgarnes', lat:64.5383, lng:-21.9214, type:'pueblo', dur:1.5, after:2,
+     addKm:2, addMin:5, note:'El pueblo bisagra entre el sur y el oeste, sobre un fiordo. Tiene el Settlement Centre, un museo chico y muy bien hecho sobre la colonización vikinga y la saga de Egill.',
+     tip:'Es el punto medio natural del traslado y hay supermercado: última compra decente antes de Snæfellsnes.'},
+    {name:'Gerðuberg', wiki:'Gerðuberg cliffs', lat:64.7830, lng:-22.3630, type:'naturaleza', dur:0.5, after:2,
+     addKm:3, addMin:5, note:'Un paredón de cientos de columnas de basalto hexagonales, todas de la misma altura, alineadas como un muro construido. Unos 500 metros de largo.',
+     tip:'A 200 m de la ruta 54, gratis y sin gente. Parada de 20 minutos que rompe bien el tramo largo.'}],
+  flags:[{t:'alert',h:'Día al límite: 10 h',b:'Þingvellir, las termas de Hvammsvík, Ytri Tunga y 316 km de ruta en una sola jornada, contra 12 h de luz. Reservá Hvammsvík temprano en la tarde y no antes: si el turno cae al mediodía, no llegan a Ytri Tunga con luz. Los cupos son muy limitados y los horarios centrales se agotan primero.'}]},
+
+{ n:6, dow:'Vie', date:'25 sep', title:'Ballenas desde Ólafsvík', sun:'07:16 – 19:05',
+  route:[
+    {base:2},
+    {name:'Láki Tours · Ólafsvík', wiki:'Ólafsvík', lat:64.8945, lng:-23.7089, type:'reserva', dur:3.5, book:true,
+     note:'Salen del puerto de Ólafsvík hacia la bahía de Breiðafjörður. En septiembre la temporada fuerte es de jorobadas, minke, calderones y delfines de pico blanco; las orcas se ven más de invierno a julio. El fondo de la escena es el glaciar Snæfellsjökull.',
+     tip:'La salida son unas 3 horas de mar abierto. Pastillas para el mareo antes de subir, no cuando ya te sentís mal. Abrigo de más: en cubierta el viento aparente es brutal. Depende 100% del viento; si cancelan, reubican al día siguiente.'},
+    {name:'Djúpalónssandur', wiki:'Djúpalónssandur', lat:64.7529, lng:-23.9026, type:'naturaleza', dur:1.5,
+     note:'Playa de piedras negras redondas y pulidas, dentro del parque nacional Snæfellsjökull. Están tiradas las chapas oxidadas de un pesquero británico que naufragó en 1948, dejadas ahí como memorial. También quedan las cuatro piedras de levantamiento con las que se medía la fuerza de los aspirantes a marinero: la más pesada son 154 kg.',
+     tip:'Se baja por el sendero Nautastígur entre paredes de lava, con escalones irregulares. El mar entra fuerte también acá. No llevarse piedras: está prohibido.'},
+    {name:'Kirkjufell y Kirkjufellsfoss', wiki:'Kirkjufell', lat:64.9276, lng:-23.3106, type:'naturaleza', dur:1,
+     note:'El cerro más fotografiado de Islandia, con esa forma de punta de flecha que le dio el apodo de "la montaña flecha" en Game of Thrones. La postal clásica es desde las cascadas del otro lado de la ruta, con el cerro atrás.',
+     tip:'A 5 minutos del alojamiento: dejalo para el atardecer y volvés a cenar sin manejar de noche. El estacionamiento pasó a ser pago. Subir el cerro es escalada técnica con muertos en el historial: no es una caminata.'},
+    {base:2}],
+  legs:[null,{km:24,min:20},{km:37,min:35},{km:58,min:55},{km:3,min:5}],
+  extras:[
+    {name:'Bæjarfoss (Ólafsvík)', lat:64.8940, lng:-23.7050, type:'caminata', dur:0.5, after:1,
+     addKm:1, addMin:3, note:'Una cascada dentro del pueblo mismo, con escalera y mirador, a cinco minutos a pie del puerto.',
+     tip:'Ideal para matar el tiempo antes de que zarpe el barco, o para descomprimir al bajar.'},
+    {name:'Svöðufoss', lat:64.8700, lng:-23.7500, type:'naturaleza', dur:0.5, after:1,
+     addKm:8, addMin:12, note:'Cae sobre columnas de basalto y, con día claro, tiene el Snæfellsjökull justo detrás. Le hicieron pasarela y estacionamiento hace poco.',
+     tip:'Acceso llano, apto para todos. Quince minutos y de vuelta al auto.'},
+    {name:'Lóndrangar y Malarrif', wiki:'Lóndrangar', lat:64.7350, lng:-23.7900, type:'caminata', dur:1, after:2,
+     addKm:6, addMin:10, note:'Dos agujas de basalto de 75 y 61 metros clavadas en el mar, restos del tapón de un cráter viejo. Al lado está el faro de Malarrif y el centro de visitantes del parque, con senderos costeros que unen los dos puntos.',
+     tip:'A 3 km de Djúpalónssandur, prácticamente gratis en tiempo. El sendero por la loma de Svalþúfa tiene tramos empinados; el mirador de abajo es plano.'}],
+  flags:[{t:'alert',h:'Láki Tours depende del viento',b:'Reservá los tickets por internet: con la reserva hecha tienen prioridad de reprogramación si el capitán cancela, cosa que quien compra en el puerto no tiene. Si cancelan, el sábado de Arnarstapi es el día con margen para reacomodarlo.'}]},
+
+{ n:7, dow:'Sáb', date:'26 sep', title:'Acantilados de Arnarstapi', sun:'07:19 – 19:01',
+  route:[
+    {base:2},
+    {name:'Arnarstapi', wiki:'Arnarstapi', lat:64.7676, lng:-23.6217, type:'pueblo', dur:0.5,
+     note:'Un puerto pesquero diminuto al pie del Snæfellsjökull, con una estatua enorme de piedra de Bárður Snæfellsás, el medio-gigante protector de la península según la saga.',
+     tip:'Arranque del sendero costero. Hay estacionamiento, baños y un café. Es el punto donde conviene dejar el auto y hacer la caminata de ida y vuelta.'},
+    {name:'Sendero Arnarstapi – Hellnar', wiki:'Arnarstapi', lat:64.7616, lng:-23.6339, type:'caminata', dur:2.5,
+     note:'2,5 km por lado bordeando acantilados de lava negra, con arcos de roca, bufaderos donde el mar explota hacia arriba y colonias de aves marinas. Cruza un campo de lava protegido y no tiene ni una subida seria.',
+     tip:'Es el mejor trekking del viaje para este grupo: espectacular y completamente llano. El borde no tiene baranda en varios tramos y el viento empuja: mantenerse del lado de tierra del sendero.'},
+    {name:'Hellnar', wiki:'Hellnar', lat:64.7556, lng:-23.6461, type:'pueblo', dur:0.5,
+     note:'La otra punta del sendero, otro caserío de pescadores con una cueva marina, Baðstofa, donde la luz cambia de color según la hora.',
+     tip:'Hay un café con vista al mar, pero en septiembre puede estar cerrado: verificá antes de contar con él para el almuerzo.'},
+    {base:2}],
+  legs:[null,{km:48,min:45},{km:1,min:3},{km:6,min:9},{km:52,min:50}],
+  extras:[
+    {name:'Rauðfeldsgjá', wiki:'Rauðfeldsgjá', lat:64.7896, lng:-23.5117, type:'caminata', dur:0.75, after:0,
+     addKm:3, addMin:5, note:'Una grieta angosta que se mete derecho adentro de la montaña, tan cerrada que desde la ruta parece un tajo. Adentro el arroyo corre por el piso y la luz baja filtrada desde muy arriba.',
+     tip:'Justo sobre la ruta 574. Los primeros metros son fáciles y ya valen la pena; más adentro hay que pisar el agua y trepar piedras mojadas. Se puede entrar solo un poco y volver.'},
+    {name:'Gatklettur', lat:64.7690, lng:-23.6270, type:'naturaleza', dur:0.25, after:1,
+     addKm:0, addMin:0, note:'El arco de piedra circular sobre el mar, en el borde de Arnarstapi. Es la foto que todos conocen de la península.',
+     tip:'Está sobre el sendero, a metros del estacionamiento: no cuesta nada de tiempo extra.'},
+    {name:'Búðakirkja', wiki:'Búðir', lat:64.8215, lng:-23.3856, type:'naturaleza', dur:0.5, after:3,
+     addKm:8, addMin:10, note:'Una iglesia de madera pintada de negro, sola en medio de un campo de lava cubierto de musgo, con el cementerio cercado alrededor. Reconstruida en 1987 según la original de 1848.',
+     tip:'Camino a la base. Se ve todo desde afuera en 20 minutos; el interior casi nunca está abierto.'},
+    {name:'Bjarnarfoss', lat:64.8230, lng:-23.3900, type:'naturaleza', dur:0.5, after:3,
+     addKm:2, addMin:4, note:'Una cascada alta y fina que cae por un paredón de basalto justo arriba de Búðir, visible desde la ruta.',
+     tip:'Tiene pasarela y mirador nuevos. Se combina con Búðakirkja en la misma parada.'}],
+  flags:[{t:'sig',h:'El día colchón',b:'Poco más de 5 h con el plan base, y es el único día del viaje con aire de sobra. Sirve para reacomodar el avistaje si el viernes lo cancelan por viento, o para descansar las piernas y sumar dos o tres de las sugeridas.'}]},
+
+{ n:8, dow:'Dom', date:'27 sep', title:'Cráteres y costa oeste', sun:'07:22 – 18:57',
+  route:[
+    {base:2},
+    {name:'Cráter Saxhóll', wiki:'Saxhóll', lat:64.8586, lng:-23.8069, type:'caminata', dur:1,
+     note:'Un cono de escoria roja de unos 3.000 años, con el cráter abierto arriba y vista al campo de lava que largó, al glaciar y al mar. Le construyeron una escalera metálica en zigzag que sube todo el cono.',
+     tip:'Es la forma más accesible del viaje de pararse en el borde de un cráter: 5 a 10 minutos de escalera con descansos. Arriba pega mucho viento.'},
+    {name:'Faro de Svörtuloft', wiki:'Öndverðarnes', lat:64.8724, lng:-24.0480, type:'naturaleza', dur:1.5,
+     note:'Un faro naranja chillón sobre acantilados negros cortados a pico, en la punta más occidental de la península. El contraste de color y la ausencia total de vegetación le dan un aire lunar. Abajo rompe el Atlántico sin nada que lo frene.',
+     tip:'Los últimos kilómetros son de ripio con piedra suelta: despacio, y ojo con la pintura. No hay servicios ni señal. Cerca del borde no hay baranda.'},
+    {base:2}],
+  legs:[null,{km:55,min:50},{km:22,min:30},{km:76,min:75}],
+  extras:[
+    {name:'Hellissandur', wiki:'Hellissandur', lat:64.9160, lng:-23.8100, type:'pueblo', dur:0.75, after:0,
+     addKm:3, addMin:5, note:'El pueblo más antiguo de pescadores de la península, convertido en galería a cielo abierto: los murales cubren galpones, tanques y paredones enteros. También está la antena de radio más alta de Europa occidental.',
+     tip:'Se recorre en auto y a pie en media hora. Sirve de plan B si el viento arruina la costa expuesta.'},
+    {name:'Skarðsvík', lat:64.8656, lng:-23.9752, type:'naturaleza', dur:0.75, after:2,
+     addKm:10, addMin:15, note:'Una playa de arena dorada encajada entre paredones de lava negra, con el agua de un turquesa que no parece del Atlántico Norte. Es una rareza geológica en esta costa. Cerca apareció una tumba vikinga.',
+     tip:'Al lado de Svörtuloft. La bajada a la arena es corta pero irregular.'},
+    {name:'Öndverðarnes', wiki:'Öndverðarnes', lat:64.8880, lng:-24.0400, type:'naturaleza', dur:0.75, after:2,
+     addKm:6, addMin:15, note:'La punta extrema de la península, con un faro chiquito naranja y Fálki, un pozo de agua de piedra usado desde la época vikinga. Se ven aves marinas y a veces ballenas desde tierra.',
+     tip:'Camino de ripio angosto y con pozos: manejá muy despacio. Si el auto no es alto, evaluá dejarlo.'},
+    {name:'Cueva Vatnshellir', wiki:'Vatnshellir', lat:64.7495, lng:-23.8180, type:'reserva', dur:1, after:2,
+     addKm:12, addMin:15, note:'Un tubo de lava de 8.000 años que baja 35 metros por tres cámaras, con formaciones y colores minerales. Es la cueva que Julio Verne eligió como entrada en "Viaje al centro de la Tierra". En el punto más profundo apagan las luces.',
+     tip:'Visita guiada de 45 minutos, casco y linterna incluidos, sobre la ruta 574 con estacionamiento propio. Se baja por escalera caracol de 35 m: es el punto a evaluar para el grupo. Hay tarifa reducida para mayores.'}],
+  flags:[{t:'sig',h:'Última noche de auroras',b:'El día es corto, poco más de 5 h. Conviene volver con luz, cenar temprano y dejar la noche libre: es la última chance de salir al porche si la app marca actividad, y Grundarfjörður tiene poca contaminación lumínica.'}]},
+
+{ n:9, dow:'Lun', date:'28 sep', title:'Reikiavik, Reykjanes y vuelo', sun:'07:25 – 18:54',
+  route:[
+    {base:2},
+    {name:'Reikiavik — se queda papá', wiki:'Reykjavík', lat:64.1466, lng:-21.9426, type:'logística', dur:1, approx:true,
+     note:'Papá se queda en Reikiavik, así que acá el grupo se separa y el resto sigue hacia Reykjanes. Es la única parada urbana del viaje.',
+     tip:'Del centro a KEF hay 50 minutos en auto, y el bus Flybus sale de la terminal BSÍ con salidas coordinadas con los vuelos. Contá tiempo para bajar valijas y despedirse sin apuro.'},
+    {name:'Gunnuhver', wiki:'Gunnuhver', lat:63.8181, lng:-22.6839, type:'naturaleza', dur:1,
+     note:'El campo geotérmico más violento de Reykjanes: fumarolas de vapor a presión, barro hirviendo y suelo teñido de amarillo y naranja por el azufre. El nombre viene de una leyenda sobre un fantasma al que tiraron adentro de la fuente.',
+     tip:'Todo se recorre por pasarelas de madera; salirse del sendero es peligroso, el suelo es una costra. Huele fuerte a azufre. Estuvo cerrado por cortes de ruta durante erupciones anteriores.'},
+    {name:'Blue Lagoon', wiki:'Blue Lagoon (geothermal spa)', lat:63.8804, lng:-22.4495, type:'termas', dur:3, book:true,
+     note:'Agua celeste lechosa —el color viene de la sílice en suspensión— en medio de un campo de lava negra. No es un fenómeno natural: es el agua de descarte de la usina geotérmica de Svartsengi, que resultó ser buenísima para la piel.',
+     tip:'De las tres termas es la más accesible: pasarelas, barandas y entrada al agua gradual. Reservar con meses. Sacate las alhajas y ponete mucho acondicionador antes de entrar, la sílice apelmaza el pelo.'},
+    {name:'Aeropuerto de Keflavík (KEF)', wiki:'Keflavík International Airport', lat:63.9850, lng:-22.6056, type:'logística', dur:2,
+     note:'Devolución del auto y check-in. El vuelo sale 00:20 del martes 29.',
+     tip:'Cargá nafta antes de entrar al predio: devolver con el tanque corto se cobra caro. Revisá el auto con el empleado y sacá fotos.'}],
+  legs:[null,{km:185,min:140},{km:65,min:55},{km:26,min:25},{km:23,min:20}],
+  extras:[
+    {name:'Sky Lagoon', lat:64.0870, lng:-21.9420, type:'termas', dur:2.5, after:1,
+     addKm:8, addMin:12, note:'Termas al borde del mar en Kópavogur, con una pileta de borde infinito mirando al Atlántico y un circuito de siete pasos entre sauna, vapor y agua fría.',
+     tip:'Es el plan B más sólido si Reykjanes cierra por actividad volcánica: queda fuera de la zona y prácticamente sobre el camino desde Reikiavik.'},
+    {name:'Puente entre continentes', lat:63.8680, lng:-22.6760, type:'naturaleza', dur:0.5, after:1,
+     addKm:5, addMin:7, note:'Una pasarela peatonal tendida sobre la grieta entre las placas de Norteamérica y Eurasia, en medio de un campo de arena volcánica. Es simbólico más que espectacular, pero se cruza de un continente al otro en veinte pasos.',
+     tip:'Gratis, plano, quince minutos. A pocos km de Gunnuhver: si van a uno, va el otro.'},
+    {name:'Reykjanesviti y Valahnúkamöl', wiki:'Reykjanesviti', lat:63.8127, lng:-22.7052, type:'naturaleza', dur:0.75, after:2,
+     addKm:4, addMin:8, note:'El faro más antiguo de Islandia sobre una loma, y abajo los acantilados de Valahnúkamöl con columnas de basalto y el mar rompiendo contra la piedra. Enfrente asoma Eldey, un peñón donde vive una de las colonias de alcatraces más grandes del mundo.',
+     tip:'Al lado de Gunnuhver. También quedó inaccesible por cortes de ruta en erupciones pasadas.'},
+    {name:'Brimketill', lat:63.8189, lng:-22.5145, type:'naturaleza', dur:0.5, after:2,
+     addKm:14, addMin:18, note:'Una "bañadera" natural tallada en la lava por el mar, que según la leyenda usaba una giganta. Con oleaje grande el agua explota adentro del hueco.',
+     tip:'Mirador con baranda, parada de 20 minutos. No bajar a la roca: la ola entra sin aviso.'}],
+  flags:[
+    {t:'alert',h:'El día más cargado del viaje',b:'11 h entre 300 km de ruta, la parada en Reikiavik, Reykjanes, las termas y el check-in, contra 11 h 30 de luz, y con el vuelo a las 00:20. Si el día se atrasa, lo primero que sale es Gunnuhver: devuelve dos horas y deja la tarde tranquila en la Blue Lagoon.'},
+    {t:'alert',h:'Reykjanes: llevar un plan B',b:'La Oficina Meteorológica islandesa reportó en 2026 la mayor acumulación de magma de toda la serie y considera probable una nueva erupción a corto plazo, al norte de Grindavík. En episodios anteriores cerraron temporalmente la Blue Lagoon, Gunnuhver y el faro de Reykjanes por cortes de ruta; los vuelos nunca se vieron afectados, porque son erupciones de fisura, sin ceniza. La alternativa está en las sugeridas: Sky Lagoon, en Kópavogur, fuera de la zona. Chequeá safetravel.is y vedur.is el día antes.'}]}
+
+];
+
+/* ---------- cálculo por día ---------- */
+function calc(d, withSug){
+  let act = 0;
+  seqOf(d, withSug).forEach(s=>{ if(!s.isBase) act += s.dur||0; });
+  const r = RT[rtKey(d, withSug)];
+  if(r && r.ok){
+    const km  = r.legs.reduce((a,l)=>a+l.km, 0);
+    const drv = r.legs.reduce((a,l)=>a+l.h, 0);
+    return {km, drv, act, tot:drv+act, routed:true};
+  }
+  let km = 0, min = 0;
+  d.route.forEach((s,i)=>{ if(d.legs[i]){ km += d.legs[i].km; min += d.legs[i].min; } });
+  if(withSug) d.extras.forEach(x=>{ km += x.addKm; min += x.addMin; });
+  return {km, drv:min/60, act, tot:min/60+act, routed:false};
+}
+
+/* ---------- mapa ---------- */
+const GEO = {
+  coast: {"type":"MultiPolygon","coordinates":[[[[-14.563629,66.384508],[-14.610748,66.363227],[-14.788197,66.33039],[-14.867177,66.305854],[-14.959137,66.296454],[-14.99059,66.285834],[-15.014801,66.268378],[-14.978261,66.259508],[-14.935211,66.22191],[-14.952138,66.193305],[-15.05602,66.148139],[-15.134633,66.143256],[-15.161,66.133612],[-15.179351,66.111314],[-15.133453,66.0987],[-15.074127,66.097113],[-15.061391,66.089342],[-15.055776,66.07038],[-15.09675,66.056098],[-15.075999,66.049628],[-14.963206,66.048041],[-14.898061,66.03559],[-14.852691,66.037177],[-14.770416,66.067857],[-14.71935,66.07038],[-14.677317,66.05622],[-14.663238,66.041164],[-14.651479,66.006741],[-14.616933,65.997748],[-14.603342,65.95303],[-14.623769,65.939399],[-14.623769,65.919582],[-14.650461,65.88817],[-14.726796,65.850653],[-14.800526,65.827948],[-14.822987,65.815863],[-14.821156,65.798407],[-14.891265,65.761217],[-14.86144,65.76203],[-14.834869,65.770901],[-14.788197,65.796047],[-14.844106,65.735175],[-14.808705,65.727729],[-14.772817,65.732001],[-14.694407,65.7508],[-14.479726,65.774888],[-14.361562,65.79678],[-14.329498,65.782375],[-14.372874,65.740383],[-14.397613,65.730048],[-14.395131,65.721503],[-14.378977,65.70718],[-14.274322,65.672512],[-14.357818,65.656073],[-14.382232,65.630276],[-14.433909,65.604804],[-14.454213,65.583441],[-14.530181,65.545478],[-14.557037,65.51789],[-14.562367,65.501166],[-14.52831,65.530829],[-14.472646,65.552314],[-14.320221,65.652411],[-14.298492,65.65884],[-14.271718,65.655951],[-14.192372,65.631537],[-14.247629,65.665025],[-14.027903,65.610419],[-13.871409,65.619045],[-13.85969,65.614163],[-13.850942,65.591986],[-13.869618,65.583157],[-13.869618,65.57689],[-13.838206,65.577379],[-13.815012,65.569403],[-13.821278,65.54149],[-13.805776,65.528632],[-13.787668,65.521674],[-13.741119,65.55036],[-13.715443,65.558295],[-13.685292,65.555162],[-13.677846,65.535346],[-13.651194,65.535346],[-13.609609,65.514228],[-13.607981,65.492133],[-13.651194,65.459621],[-13.63683,65.426093],[-13.677846,65.411811],[-13.667633,65.405707],[-13.670969,65.377631],[-13.704742,65.367336],[-13.795806,65.373114],[-13.83552,65.364],[-13.733062,65.343492],[-13.729848,65.327094],[-13.784535,65.309801],[-13.83434,65.309638],[-14.006744,65.28205],[-13.991119,65.272691],[-13.832509,65.297593],[-13.78425,65.295722],[-13.687652,65.306383],[-13.607818,65.288642],[-13.582265,65.276923],[-13.567983,65.260972],[-13.654205,65.219957],[-13.780873,65.206366],[-14.034088,65.200141],[-14.003326,65.189765],[-13.886952,65.200141],[-13.733062,65.192694],[-13.626617,65.200141],[-13.616607,65.196763],[-13.63683,65.178412],[-13.643666,65.159166],[-13.746693,65.144924],[-13.746693,65.137437],[-13.669301,65.144355],[-13.651194,65.137437],[-13.651194,65.131293],[-13.685292,65.117011],[-13.644399,65.114936],[-13.626617,65.103949],[-13.592193,65.123765],[-13.561106,65.15176],[-13.520172,65.172187],[-13.517812,65.136298],[-13.526967,65.096503],[-13.508372,65.090766],[-13.502919,65.081285],[-13.526967,65.055487],[-13.609609,65.035061],[-13.582672,65.01203],[-13.585317,65.007717],[-13.647369,64.98664],[-13.719472,64.994086],[-13.781606,64.989325],[-13.801991,64.994086],[-13.830312,65.029608],[-13.947865,65.054511],[-14.003326,65.077623],[-14.034088,65.082831],[-14.017323,65.063788],[-13.993764,65.055487],[-14.029775,65.038398],[-14.233388,65.035061],[-14.233388,65.027574],[-13.91804,65.014594],[-13.893951,65.003079],[-13.867909,64.978217],[-13.821278,64.959947],[-13.71817,64.939602],[-13.698313,64.925198],[-13.739898,64.9112],[-13.78893,64.914374],[-13.876454,64.932603],[-13.976064,64.925198],[-14.037465,64.936469],[-14.054596,64.932603],[-13.995513,64.914496],[-13.852284,64.900295],[-13.787668,64.877387],[-13.766916,64.853827],[-13.832102,64.829576],[-13.936594,64.847073],[-13.96642,64.835842],[-13.858022,64.81684],[-13.839833,64.809312],[-13.839223,64.79857],[-13.981923,64.79678],[-14.013661,64.802314],[-14.048451,64.788642],[-14.048451,64.781195],[-13.986318,64.74022],[-14.048451,64.719713],[-14.270619,64.699286],[-14.339467,64.716295],[-14.368072,64.755316],[-14.393625,64.766547],[-14.420562,64.789618],[-14.513905,64.802314],[-14.4558,64.790229],[-14.466135,64.761298],[-14.450673,64.752875],[-14.383616,64.74022],[-14.385243,64.720852],[-14.371449,64.704983],[-14.339467,64.685614],[-14.288686,64.678127],[-14.270172,64.669501],[-14.281158,64.658271],[-14.274322,64.651435],[-14.441965,64.675727],[-14.493479,64.658271],[-14.417714,64.631008],[-14.40807,64.619778],[-14.40925,64.610256],[-14.438832,64.596869],[-14.572174,64.596869],[-14.584381,64.590318],[-14.572092,64.576972],[-14.541819,64.565863],[-14.531606,64.555609],[-14.490468,64.548407],[-14.486562,64.555854],[-14.445383,64.560696],[-14.383616,64.600735],[-14.352528,64.6105],[-14.346181,64.605618],[-14.466135,64.534735],[-14.476674,64.496894],[-14.509348,64.47191],[-14.513905,64.462795],[-14.510487,64.442328],[-14.525624,64.434516],[-14.544911,64.405097],[-14.648752,64.400092],[-14.746693,64.383979],[-14.703359,64.398871],[-14.568512,64.418118],[-14.594065,64.425605],[-14.713124,64.431708],[-14.712514,64.41413],[-14.757192,64.39765],[-14.782053,64.377753],[-14.848948,64.357123],[-14.904897,64.322455],[-14.891265,64.349799],[-14.920318,64.331122],[-14.949045,64.322455],[-14.949818,64.311957],[-14.931956,64.301418],[-14.891265,64.308824],[-14.877594,64.28148],[-14.899973,64.281643],[-14.929433,64.264838],[-14.949045,64.260443],[-15.015859,64.26675],[-15.086049,64.298285],[-15.106679,64.301418],[-15.143951,64.28148],[-15.17927,64.287909],[-15.192291,64.28148],[-15.179351,64.274115],[-15.190053,64.269192],[-15.226471,64.26789],[-15.206614,64.301418],[-15.254506,64.298041],[-15.265777,64.320543],[-15.290273,64.334377],[-15.302154,64.329332],[-15.302154,64.322455],[-15.288197,64.312567],[-15.281117,64.295233],[-15.32315,64.3039],[-15.336293,64.308824],[-15.326568,64.329006],[-15.341298,64.350043],[-15.366444,64.36933],[-15.408437,64.387641],[-15.4735,64.39765],[-15.401479,64.380805],[-15.363637,64.336819],[-15.380686,64.329779],[-15.397817,64.336819],[-15.397817,64.329332],[-15.377553,64.321275],[-15.374013,64.305894],[-15.397817,64.274115],[-15.422271,64.2685],[-15.478017,64.275133],[-15.500885,64.26789],[-15.43871,64.260443],[-15.528066,64.241156],[-15.645904,64.228827],[-15.672109,64.219428],[-15.685699,64.233791],[-15.713612,64.21662],[-15.802398,64.18537],[-15.719106,64.197699],[-15.699452,64.191555],[-15.733022,64.179267],[-15.992055,64.144477],[-16.02831,64.130072],[-15.981191,64.130072],[-15.981191,64.123928],[-16.075999,64.09394],[-16.143625,64.063544],[-16.151275,64.054999],[-16.161733,64.064643],[-16.181793,64.062323],[-16.19286,64.054999],[-16.19286,64.048163],[-16.17927,64.048163],[-16.17927,64.041938],[-16.261138,64.020819],[-16.254872,64.035102],[-16.308909,64.017076],[-16.334788,64.003241],[-16.350494,63.986721],[-16.334096,63.986314],[-16.311025,63.99726],[-16.336903,63.974066],[-16.422353,63.938137],[-16.470204,63.904771],[-16.501332,63.897366],[-16.476308,63.905219],[-16.460357,63.924628],[-16.611195,63.869371],[-16.745351,63.852118],[-16.782541,63.863186],[-16.747792,63.849555],[-16.782541,63.842719],[-16.779775,63.818305],[-16.785064,63.806464],[-16.796213,63.801703],[-16.805531,63.828559],[-16.861073,63.858791],[-16.887359,63.865668],[-16.898264,63.854071],[-16.895823,63.807766],[-16.901967,63.801703],[-16.915354,63.805162],[-16.912221,63.839301],[-16.930043,63.8664],[-16.939565,63.809149],[-16.926137,63.800035],[-16.930898,63.793199],[-16.966908,63.787502],[-16.955637,63.810126],[-16.960683,63.828437],[-16.953847,63.841051],[-16.941274,63.845526],[-16.947011,63.856391],[-16.940297,63.897773],[-16.946685,63.908189],[-16.968984,63.920315],[-16.97704,63.888821],[-16.966908,63.869371],[-16.983225,63.86286],[-17.018544,63.862006],[-17.02892,63.849555],[-17.00475,63.817084],[-16.987945,63.809149],[-17.006215,63.797838],[-17.114858,63.794908],[-17.166127,63.809149],[-17.20344,63.798285],[-17.207102,63.815375],[-17.330556,63.781236],[-17.560943,63.7508],[-17.543568,63.766791],[-17.549672,63.787502],[-17.569081,63.763577],[-17.583363,63.760728],[-17.598053,63.767564],[-17.590647,63.746527],[-17.721018,63.705512],[-17.711171,63.727362],[-17.685292,63.739691],[-17.624827,63.746527],[-17.624827,63.753974],[-17.690989,63.769273],[-17.714752,63.781236],[-17.719879,63.767727],[-17.714752,63.753974],[-17.740468,63.745998],[-17.817209,63.753974],[-17.796742,63.746527],[-17.796742,63.740302],[-17.878407,63.731024],[-17.893056,63.719957],[-17.90453,63.69123],[-17.91808,63.679023],[-17.935902,63.675767],[-17.954416,63.685045],[-17.967356,63.6765],[-17.972076,63.66767],[-17.966949,63.66059],[-17.950673,63.657701],[-17.902821,63.671373],[-17.796742,63.671373],[-17.839752,63.634101],[-17.865834,63.623847],[-17.892323,63.630439],[-17.885487,63.636664],[-17.926422,63.636664],[-17.924957,63.627346],[-17.953114,63.628607],[-17.968617,63.622992],[-17.946889,63.620795],[-17.946929,63.602484],[-17.872467,63.604397],[-17.858225,63.609931],[-17.883046,63.576117],[-17.919057,63.545152],[-17.964955,63.522528],[-18.067372,63.501532],[-18.132924,63.479315],[-18.195383,63.472805],[-18.228139,63.493232],[-18.187367,63.505194],[-18.150624,63.526313],[-18.118886,63.527411],[-18.118886,63.534247],[-18.228139,63.527411],[-18.316803,63.548529],[-18.310658,63.541002],[-18.32433,63.534247],[-18.276763,63.501166],[-18.265696,63.466539],[-18.183665,63.463853],[-18.397694,63.449205],[-18.521596,63.422512],[-18.732045,63.396715],[-18.78303,63.39765],[-18.974762,63.424384],[-19.055653,63.414374],[-19.084625,63.418158],[-19.064117,63.424384],[-19.132436,63.438666],[-19.152659,63.425727],[-19.287262,63.438666],[-19.352162,63.459133],[-19.434153,63.466539],[-19.550933,63.502021],[-19.711578,63.521552],[-19.743235,63.534247],[-19.722035,63.539252],[-19.735748,63.548529],[-19.777089,63.541002],[-19.872914,63.548529],[-19.869985,63.543524],[-19.769887,63.534247],[-20.033803,63.542385],[-20.051015,63.554755],[-20.064076,63.548529],[-20.078359,63.554755],[-20.071523,63.541002],[-20.185699,63.54442],[-20.337717,63.601711],[-20.352691,63.609931],[-20.322499,63.601752],[-20.290639,63.609931],[-20.339101,63.616767],[-20.332265,63.636664],[-20.367096,63.619818],[-20.407338,63.630439],[-20.407338,63.636664],[-20.373158,63.630439],[-20.386545,63.645697],[-20.442128,63.671373],[-20.478668,63.706366],[-20.503529,63.705512],[-20.503529,63.699286],[-20.468658,63.677151],[-20.434641,63.64411],[-20.531606,63.68891],[-20.550689,63.712348],[-20.537099,63.719794],[-20.558217,63.740302],[-20.498525,63.763007],[-20.431264,63.767564],[-20.399648,63.761054],[-20.344146,63.734768],[-20.311147,63.732856],[-20.365793,63.767564],[-20.442128,63.787502],[-20.412017,63.812567],[-20.407338,63.822211],[-20.411122,63.836249],[-20.431142,63.836371],[-20.427846,63.822211],[-20.483022,63.787502],[-20.530181,63.76435],[-20.562408,63.756822],[-20.565053,63.72602],[-20.577504,63.714179],[-20.770416,63.7744],[-20.70523,63.7744],[-20.654368,63.760728],[-20.652333,63.766547],[-20.605946,63.767564],[-20.605946,63.7744],[-20.63386,63.7744],[-20.63386,63.781236],[-20.619618,63.781236],[-20.619618,63.787502],[-20.71581,63.781236],[-20.71581,63.787502],[-20.681793,63.807318],[-20.671783,63.837633],[-20.685618,63.86343],[-20.723256,63.869371],[-20.723256,63.863186],[-20.695139,63.857978],[-20.698313,63.844184],[-20.754506,63.80565],[-20.805287,63.794745],[-20.832509,63.801703],[-20.818227,63.781236],[-20.858632,63.800442],[-20.948842,63.827216],[-21.076731,63.848456],[-21.144276,63.867499],[-21.168324,63.875556],[-21.188791,63.891099],[-21.184478,63.908759],[-21.194936,63.932074],[-21.117014,63.929877],[-21.074127,63.934272],[-21.044789,63.945746],[-21.119944,63.945746],[-21.185048,63.959418],[-21.23644,63.953355],[-21.298695,63.924628],[-21.298695,63.918402],[-21.222035,63.898871],[-21.209299,63.883694],[-21.27538,63.891791],[-21.349762,63.884182],[-21.365834,63.873765],[-21.352651,63.856391],[-21.366933,63.849555],[-21.659901,63.831855],[-21.759999,63.868394],[-21.793202,63.870551],[-21.959462,63.843736],[-22.065785,63.835883],[-22.336415,63.863186],[-22.394399,63.835924],[-22.415883,63.842719],[-22.401601,63.849555],[-22.42516,63.849514],[-22.525136,63.822211],[-22.63268,63.826117],[-22.654856,63.822211],[-22.671254,63.810981],[-22.691233,63.812201],[-22.717519,63.828437],[-22.697418,63.851874],[-22.700185,63.874172],[-22.73058,63.891099],[-22.715077,63.901272],[-22.685902,63.945746],[-22.634999,63.949164],[-22.639231,63.95954],[-22.691721,63.954779],[-22.72997,63.974677],[-22.736806,63.993476],[-22.717519,64.020819],[-22.718739,64.070502],[-22.702138,64.085924],[-22.67516,64.087388],[-22.609975,64.061591],[-22.558461,64.019436],[-22.544911,63.993476],[-22.559234,63.993476],[-22.542795,63.982733],[-22.518463,63.979438],[-22.39684,63.979804],[-22.381174,63.986721],[-22.392323,63.994086],[-22.386383,64.002102],[-22.346059,64.017279],[-22.298573,64.020819],[-22.250885,64.035102],[-22.199208,64.020819],[-22.124176,64.043891],[-22.040679,64.051093],[-22.01358,64.059272],[-21.990102,64.076117],[-21.975168,64.069281],[-21.963368,64.076117],[-21.963368,64.082261],[-22.00475,64.097724],[-22.045318,64.096584],[-22.034901,64.112738],[-21.982493,64.121649],[-21.963368,64.117092],[-21.990102,64.109565],[-21.931996,64.105902],[-21.915028,64.109565],[-21.915028,64.117092],[-21.935455,64.117092],[-21.915028,64.123928],[-21.977162,64.149156],[-22.045318,64.158026],[-22.015126,64.16828],[-21.864858,64.156317],[-21.846669,64.144355],[-21.799672,64.137274],[-21.784657,64.144355],[-21.826243,64.15119],[-21.798248,64.164862],[-21.818756,64.171698],[-21.792836,64.175971],[-21.723785,64.171454],[-21.702748,64.191555],[-21.756093,64.181789],[-21.76415,64.188422],[-21.757232,64.200344],[-21.709584,64.213202],[-21.759999,64.220404],[-21.812652,64.213202],[-21.806467,64.230211],[-21.81786,64.237982],[-21.865712,64.239569],[-21.891103,64.230373],[-21.928619,64.233791],[-21.889556,64.253119],[-21.894521,64.26789],[-21.803212,64.301744],[-21.754506,64.345201],[-21.715688,64.352037],[-21.652577,64.349189],[-21.689076,64.356635],[-21.648549,64.371487],[-21.603098,64.377753],[-21.465403,64.361802],[-21.442006,64.364081],[-21.414133,64.383979],[-21.459096,64.37287],[-21.483022,64.377753],[-21.483022,64.383979],[-21.449452,64.390774],[-21.455719,64.39765],[-21.449452,64.39765],[-21.631174,64.402655],[-21.716542,64.393866],[-21.792104,64.364081],[-21.812652,64.342963],[-21.865834,64.334174],[-21.962636,64.297309],[-22.099965,64.315009],[-22.099965,64.322455],[-22.018056,64.349799],[-21.984771,64.370266],[-21.963368,64.376125],[-21.941721,64.370307],[-21.859731,64.390774],[-21.948883,64.394965],[-22.011342,64.382758],[-22.045318,64.405097],[-22.03189,64.414455],[-22.021474,64.456],[-21.999867,64.453925],[-21.975087,64.50373],[-21.83727,64.539008],[-21.777821,64.541571],[-21.792063,64.555487],[-21.818756,64.555854],[-21.818756,64.562079],[-21.762278,64.592108],[-21.702748,64.6105],[-21.64745,64.6105],[-21.651438,64.592515],[-21.60558,64.589342],[-21.579905,64.571845],[-21.496653,64.569525],[-21.513092,64.575181],[-21.565541,64.575751],[-21.620188,64.603013],[-21.579213,64.6105],[-21.579213,64.616645],[-21.68224,64.616645],[-21.68224,64.624172],[-21.606516,64.647691],[-21.510894,64.643988],[-21.510894,64.651435],[-21.613352,64.658271],[-21.677317,64.632514],[-21.702748,64.631008],[-21.702748,64.637844],[-21.676584,64.648586],[-21.661122,64.665717],[-21.721832,64.638821],[-21.728424,64.615709],[-21.792104,64.590033],[-21.859731,64.575751],[-21.853505,64.562079],[-21.911204,64.563218],[-22.009023,64.525092],[-22.024892,64.527981],[-22.035634,64.537665],[-22.018056,64.569525],[-22.038808,64.566596],[-22.048655,64.555406],[-22.051584,64.524563],[-22.079457,64.500637],[-22.085032,64.478664],[-22.093088,64.472724],[-22.129058,64.472886],[-22.164784,64.459662],[-22.199045,64.471869],[-22.2235,64.500637],[-22.257639,64.487006],[-22.231109,64.515286],[-22.22704,64.530341],[-22.237172,64.541571],[-22.2235,64.548407],[-22.257639,64.555854],[-22.243398,64.575751],[-22.289377,64.560858],[-22.339508,64.555854],[-22.357533,64.56802],[-22.364817,64.584418],[-22.361195,64.600246],[-22.346995,64.6105],[-22.346995,64.616645],[-22.364329,64.618109],[-22.442535,64.665717],[-22.365102,64.642646],[-22.339508,64.651435],[-22.360707,64.651435],[-22.354604,64.662787],[-22.319651,64.678778],[-22.333363,64.685614],[-22.333363,64.69245],[-22.217519,64.717434],[-22.18871,64.733385],[-22.18871,64.74022],[-22.250722,64.717108],[-22.34317,64.699205],[-22.402089,64.676337],[-22.422109,64.685614],[-22.349233,64.72309],[-22.339508,64.733385],[-22.346995,64.74022],[-22.319651,64.753852],[-22.34203,64.765123],[-22.372141,64.768744],[-22.436391,64.767524],[-22.422109,64.781195],[-22.442535,64.781195],[-22.408437,64.82274],[-22.427887,64.817572],[-22.442535,64.802314],[-22.457021,64.815334],[-22.476715,64.809149],[-22.476715,64.802314],[-22.53189,64.809149],[-22.547475,64.805813],[-22.593414,64.788642],[-22.593414,64.781195],[-22.56607,64.774359],[-22.658193,64.766669],[-22.682118,64.774359],[-22.638051,64.777777],[-22.672515,64.802314],[-22.778391,64.802314],[-22.710072,64.781195],[-22.710072,64.774359],[-22.736887,64.774807],[-22.783925,64.792711],[-22.812571,64.794867],[-22.805735,64.794867],[-23.1881,64.804145],[-23.246246,64.830471],[-23.301666,64.832221],[-23.398427,64.82274],[-23.423329,64.802314],[-23.457143,64.793647],[-23.573476,64.809149],[-23.538442,64.816799],[-23.555247,64.81981],[-23.593495,64.810981],[-23.623525,64.794257],[-23.628082,64.774359],[-23.646596,64.750881],[-23.67394,64.741116],[-23.747874,64.74022],[-23.833567,64.725898],[-23.905873,64.743964],[-23.946116,64.760891],[-23.955881,64.786689],[-24.016957,64.831732],[-24.060048,64.891059],[-24.053293,64.898505],[-24.033111,64.889635],[-24.014272,64.893378],[-23.958404,64.917304],[-23.849762,64.930569],[-23.748118,64.906928],[-23.63801,64.898505],[-23.600819,64.918362],[-23.559438,64.917385],[-23.512847,64.946357],[-23.47175,64.952379],[-23.381093,64.945624],[-23.381093,64.953111],[-23.395334,64.966783],[-23.353424,64.968004],[-23.339752,64.962633],[-23.346913,64.945624],[-23.33373,64.941392],[-23.317209,64.953437],[-23.30602,64.953111],[-23.297027,64.922268],[-23.278676,64.932603],[-23.263092,64.926256],[-23.245025,64.930121],[-23.224029,64.949408],[-23.24059,64.986884],[-23.23766,65.000922],[-23.210194,65.016913],[-23.168568,65.020087],[-23.086822,65.014594],[-23.106801,64.995429],[-23.135325,64.98664],[-23.127797,64.972968],[-23.147939,64.968085],[-23.162587,64.953111],[-23.107289,64.918362],[-23.114003,64.946112],[-23.109527,64.956855],[-23.099843,64.966783],[-23.066396,64.972968],[-23.04898,64.997504],[-23.021392,65.013007],[-22.992787,65.014228],[-22.965647,65.004299],[-22.94286,64.98664],[-22.906077,65.003485],[-22.844716,65.009914],[-22.785227,65.027574],[-22.801137,65.031928],[-22.873891,65.027574],[-22.873891,65.035061],[-22.831858,65.03913],[-22.757069,65.071926],[-22.717519,65.075995],[-22.73058,65.069159],[-22.695872,65.062323],[-22.695872,65.049302],[-22.751088,65.027574],[-22.721181,65.026557],[-22.689605,65.035061],[-22.674428,65.007554],[-22.579742,64.980414],[-22.579742,64.98664],[-22.628163,65.014594],[-22.601064,65.029975],[-22.56607,65.035061],[-22.564117,65.048326],[-22.5454,65.052191],[-22.461903,65.050482],[-22.379994,65.058783],[-22.24474,65.047268],[-22.155181,65.027574],[-22.120432,65.041897],[-22.045318,65.041897],[-21.982533,65.027533],[-21.963368,65.035061],[-21.937164,65.027533],[-21.826243,65.035061],[-21.799672,65.044623],[-21.798655,65.057034],[-21.816477,65.066962],[-21.846669,65.069159],[-21.836578,65.082424],[-21.792104,65.096503],[-21.779286,65.108059],[-21.737416,65.159166],[-21.73412,65.193793],[-21.766103,65.207953],[-21.809478,65.206122],[-21.840484,65.192694],[-21.833079,65.178412],[-21.983876,65.123765],[-22.033844,65.114936],[-22.318959,65.138414],[-22.401601,65.165351],[-22.511871,65.154202],[-22.557688,65.168931],[-22.490346,65.185858],[-22.456858,65.178412],[-22.456858,65.185858],[-22.478993,65.192776],[-22.55248,65.185858],[-22.524037,65.214993],[-22.490346,65.233629],[-22.426178,65.251451],[-22.428863,65.267768],[-22.378041,65.267768],[-22.339508,65.295722],[-22.312856,65.304348],[-22.201283,65.317694],[-22.107004,65.348334],[-22.070872,65.367377],[-22.006825,65.381252],[-21.983876,65.391913],[-21.990102,65.398139],[-21.935455,65.385077],[-21.949086,65.405585],[-21.695302,65.453355],[-21.791331,65.440131],[-21.897572,65.446519],[-21.97643,65.439765],[-21.935455,65.467027],[-21.971547,65.481879],[-21.985097,65.492743],[-21.990102,65.508002],[-22.045318,65.501166],[-22.039662,65.487128],[-22.062815,65.484036],[-22.073232,65.487494],[-22.114247,65.52851],[-22.111399,65.497463],[-22.134755,65.473863],[-22.17162,65.459621],[-22.199208,65.432318],[-22.253814,65.433661],[-22.28067,65.451321],[-22.381581,65.482856],[-22.387196,65.491685],[-22.367502,65.508002],[-22.345815,65.514716],[-22.235097,65.524807],[-22.164784,65.54149],[-22.153717,65.545885],[-22.148346,65.57689],[-22.106801,65.596747],[-22.136383,65.593329],[-22.209828,65.548977],[-22.243886,65.537095],[-22.346995,65.52851],[-22.346995,65.535346],[-22.291737,65.555162],[-22.291737,65.562649],[-22.312489,65.561998],[-22.353261,65.54149],[-22.373931,65.538153],[-22.415883,65.548977],[-22.415883,65.54149],[-22.403717,65.53384],[-22.408844,65.524848],[-22.478627,65.508002],[-22.493398,65.511176],[-22.504018,65.52851],[-22.501454,65.569648],[-22.545888,65.634019],[-22.55838,65.624742],[-22.556956,65.597886],[-22.541005,65.576606],[-22.546539,65.560736],[-22.57665,65.536282],[-22.589182,65.53559],[-22.631459,65.565823],[-22.637766,65.539781],[-22.656158,65.528062],[-22.676829,65.532782],[-22.707631,65.572211],[-22.711985,65.588528],[-22.704742,65.605292],[-22.682118,65.624091],[-22.691233,65.629584],[-22.710072,65.624091],[-22.736806,65.631537],[-22.759389,65.629828],[-22.763417,65.618354],[-22.744862,65.584377],[-22.717519,65.508002],[-22.731516,65.501776],[-22.785227,65.508002],[-22.77953,65.522528],[-22.795725,65.533677],[-22.842275,65.530829],[-22.853261,65.53205],[-22.854115,65.54149],[-22.887603,65.54149],[-22.887603,65.548977],[-22.818715,65.58454],[-22.791982,65.589993],[-22.801991,65.600979],[-22.854115,65.617906],[-22.859609,65.595608],[-22.879954,65.576483],[-22.905263,65.566881],[-22.925771,65.573188],[-22.942738,65.60635],[-22.95344,65.610419],[-22.963979,65.562649],[-22.985219,65.551215],[-23.073476,65.538398],[-23.128651,65.54975],[-23.158111,65.562201],[-23.155141,65.583157],[-23.183013,65.576361],[-23.200022,65.556586],[-23.201324,65.534735],[-23.182444,65.521674],[-23.182444,65.514228],[-23.231435,65.487494],[-23.357493,65.49494],[-23.373036,65.498196],[-23.395904,65.514472],[-23.408274,65.513739],[-23.423329,65.508002],[-23.409006,65.501166],[-23.490346,65.477932],[-23.625396,65.466457],[-23.656077,65.473863],[-23.661285,65.457994],[-23.714101,65.426093],[-23.897532,65.404608],[-23.943837,65.406928],[-23.984364,65.418647],[-23.978749,65.434027],[-23.982981,65.441311],[-24.004872,65.453355],[-23.970693,65.446519],[-23.967763,65.464911],[-23.986195,65.474189],[-24.009023,65.472846],[-24.019154,65.459621],[-24.04308,65.474555],[-24.196685,65.501166],[-24.48176,65.488471],[-24.5183,65.49136],[-24.539906,65.508002],[-24.496002,65.518988],[-24.451568,65.545233],[-24.375396,65.569403],[-24.365793,65.617906],[-24.303375,65.638373],[-24.135406,65.606147],[-24.080556,65.57689],[-23.971303,65.558661],[-23.922963,65.52851],[-23.892812,65.522162],[-23.806793,65.535346],[-23.895009,65.54149],[-23.940785,65.572496],[-24.009999,65.599433],[-24.086781,65.651353],[-23.935943,65.638373],[-23.806793,65.610419],[-23.852651,65.638983],[-24.022857,65.676174],[-24.080556,65.706],[-24.121571,65.74079],[-24.124827,65.77733],[-24.135162,65.78913],[-24.092844,65.804755],[-24.049875,65.803534],[-23.628082,65.706],[-23.600819,65.686184],[-23.56664,65.672512],[-23.556386,65.65469],[-23.579701,65.617906],[-23.561757,65.613674],[-23.497792,65.645209],[-23.477895,65.631537],[-23.46703,65.640937],[-23.388539,65.638373],[-23.388539,65.645209],[-23.409006,65.65884],[-23.285471,65.679348],[-23.404124,65.675198],[-23.458241,65.68244],[-23.511627,65.699693],[-23.539174,65.722724],[-23.466908,65.739691],[-23.437815,65.731635],[-23.356191,65.736233],[-23.309682,65.748236],[-23.244537,65.740383],[-23.224029,65.748236],[-23.251332,65.755072],[-23.251332,65.761217],[-23.189849,65.782375],[-23.276275,65.773139],[-23.319244,65.757025],[-23.588775,65.759752],[-23.641713,65.768704],[-23.676503,65.782375],[-23.729156,65.774359],[-23.8131,65.815863],[-23.845204,65.842963],[-23.866607,65.875556],[-23.863149,65.905829],[-23.820546,65.925727],[-23.800852,65.926215],[-23.74413,65.912095],[-23.669667,65.905219],[-23.600819,65.877916],[-23.51887,65.884752],[-23.395334,65.864325],[-23.35436,65.864325],[-23.244537,65.836127],[-23.209788,65.843207],[-23.29247,65.854234],[-23.318837,65.867865],[-23.401519,65.87108],[-23.474273,65.894843],[-23.57787,65.905015],[-23.6551,65.942572],[-23.763295,65.979926],[-23.8131,66.011379],[-23.807485,66.058417],[-23.792592,66.07038],[-23.751373,66.076565],[-23.699574,66.071723],[-23.5183,66.026679],[-23.465199,66.020982],[-23.429433,66.029446],[-23.412506,66.000312],[-23.374867,65.987779],[-23.374867,65.994045],[-23.422515,66.035875],[-23.547027,66.059516],[-23.669667,66.117499],[-23.637318,66.128485],[-23.55016,66.131985],[-23.48412,66.12759],[-23.395334,66.097642],[-23.458404,66.133043],[-23.481028,66.138617],[-23.577056,66.137681],[-23.600819,66.144843],[-23.600819,66.152289],[-23.590972,66.159857],[-23.55956,66.176459],[-23.501291,66.180487],[-23.485585,66.186225],[-23.48412,66.199449],[-23.461415,66.204169],[-23.304351,66.185777],[-23.152699,66.145819],[-23.110219,66.112535],[-23.114166,66.097642],[-23.107289,66.075914],[-23.057973,66.107611],[-23.027699,66.10871],[-22.986073,66.079535],[-22.976877,66.033677],[-23.058949,65.966702],[-22.976552,66.00845],[-22.956532,66.021918],[-22.940053,66.046454],[-22.929189,66.049262],[-22.909657,66.038642],[-22.89509,66.015082],[-22.901845,66.007636],[-22.85554,66.02851],[-22.840443,66.021918],[-22.880971,65.975287],[-22.909779,65.956366],[-22.94286,65.946845],[-22.884429,65.951809],[-22.867747,65.960517],[-22.834096,66.00141],[-22.82311,66.004584],[-22.809153,65.977607],[-22.824696,65.926256],[-22.819325,65.912095],[-22.785227,65.960517],[-22.782948,66.008612],[-22.764027,66.049262],[-22.750478,66.058417],[-22.682729,66.055854],[-22.675933,66.05268],[-22.667226,66.030911],[-22.620269,66.009223],[-22.577382,65.97309],[-22.586171,65.940375],[-22.600209,65.925727],[-22.593414,65.919582],[-22.655426,65.84219],[-22.648183,65.833686],[-22.635162,65.835273],[-22.611684,65.873847],[-22.545318,65.946967],[-22.538726,65.974189],[-22.517323,65.975775],[-22.476715,65.939399],[-22.457509,65.941067],[-22.449371,65.932563],[-22.456166,65.90998],[-22.442535,65.905219],[-22.429433,65.927965],[-22.422109,65.925727],[-22.428863,65.884752],[-22.469879,65.843207],[-22.469879,65.836982],[-22.43163,65.845893],[-22.392649,65.901679],[-22.360707,65.912095],[-22.360707,65.919582],[-22.381256,65.928778],[-22.408437,65.987779],[-22.423004,66.002021],[-22.463206,66.025458],[-22.484202,66.029446],[-22.463735,66.065863],[-22.449371,66.075914],[-22.392812,66.084052],[-22.381174,66.097642],[-22.488393,66.076728],[-22.572174,66.093695],[-22.628163,66.117499],[-22.865956,66.159491],[-22.935862,66.189765],[-22.97761,66.234198],[-22.930898,66.246405],[-22.751088,66.262152],[-22.606557,66.246772],[-22.593414,66.234198],[-22.552358,66.221381],[-22.538726,66.227362],[-22.559234,66.248481],[-22.484486,66.251166],[-22.440541,66.265448],[-22.390614,66.267524],[-22.367502,66.275214],[-22.503407,66.266425],[-22.564565,66.283637],[-22.544301,66.285712],[-22.502919,66.306098],[-22.469879,66.309312],[-22.469879,66.316799],[-22.492096,66.321967],[-22.595693,66.291734],[-22.654856,66.289455],[-22.710072,66.29564],[-22.711415,66.306464],[-22.682118,66.323635],[-22.669097,66.357123],[-22.607655,66.371405],[-22.683949,66.358303],[-22.763051,66.323676],[-22.82311,66.316799],[-22.835357,66.322659],[-22.828603,66.335761],[-22.799469,66.357123],[-22.799469,66.364569],[-22.83373,66.358832],[-22.939687,66.301459],[-23.098053,66.318305],[-23.139312,66.327786],[-23.189687,66.355292],[-23.176259,66.364569],[-23.046742,66.360663],[-23.02481,66.391832],[-23.084625,66.403266],[-23.135325,66.432807],[-23.104726,66.442816],[-23.011708,66.419176],[-23.032297,66.440253],[-22.922719,66.447659],[-22.909495,66.44245],[-22.89509,66.426011],[-22.873525,66.423774],[-22.864491,66.431383],[-22.868153,66.441392],[-22.950307,66.466986],[-22.832631,66.463813],[-22.797271,66.449693],[-22.752187,66.442694],[-22.695872,66.419176],[-22.670237,66.420966],[-22.607655,66.446479],[-22.613881,66.46015],[-22.574534,66.465888],[-22.510732,66.440416],[-22.426625,66.427924],[-22.422109,66.440253],[-22.429351,66.450141],[-22.455556,66.457465],[-22.463124,66.466986],[-22.43102,66.464748],[-22.400136,66.452216],[-22.376698,66.432563],[-22.367502,66.408922],[-22.350006,66.394192],[-22.268625,66.375922],[-22.243398,66.357123],[-22.257639,66.347154],[-22.202301,66.337226],[-22.202301,66.33039],[-22.228261,66.328559],[-22.229644,66.309312],[-22.214101,66.2897],[-22.229644,66.28262],[-22.229644,66.275214],[-22.216664,66.268378],[-22.187123,66.279486],[-22.155181,66.28262],[-22.128285,66.268297],[-22.105621,66.287828],[-22.089589,66.289862],[-22.080393,66.282864],[-22.086293,66.268378],[-21.996938,66.268378],[-21.979319,66.27497],[-21.921783,66.241034],[-21.990102,66.213772],[-21.976796,66.21011],[-21.920725,66.219672],[-21.853505,66.193305],[-21.812652,66.199449],[-21.749867,66.185777],[-21.757314,66.172756],[-21.740061,66.168199],[-21.730092,66.156236],[-21.730336,66.14411],[-21.743642,66.138617],[-21.729726,66.117865],[-21.723012,66.082221],[-21.702748,66.07038],[-21.653961,66.077582],[-21.641225,66.07038],[-21.639272,66.056545],[-21.667958,66.021918],[-21.620188,66.039008],[-21.620717,66.063463],[-21.641225,66.083441],[-21.593251,66.096381],[-21.548818,66.097642],[-21.527659,66.075914],[-21.509185,66.072333],[-21.551869,66.056098],[-21.558461,66.046536],[-21.534779,66.025702],[-21.509389,66.017076],[-21.401031,66.029446],[-21.348704,66.020697],[-21.330637,66.009019],[-21.318512,65.987779],[-21.459299,65.982327],[-21.486073,65.973212],[-21.606516,65.960517],[-21.588124,65.946357],[-21.503774,65.960517],[-21.410024,65.967475],[-21.380605,65.960517],[-21.43578,65.939399],[-21.43578,65.932563],[-21.328114,65.945258],[-21.301747,65.935981],[-21.28718,65.915839],[-21.284047,65.898627],[-21.295888,65.885565],[-21.325917,65.877916],[-21.278188,65.864325],[-21.278188,65.856879],[-21.327789,65.809027],[-21.375315,65.784898],[-21.476796,65.768704],[-21.476796,65.761217],[-21.401031,65.761217],[-21.332143,65.74079],[-21.443512,65.690497],[-21.579213,65.69302],[-21.629221,65.719387],[-21.647206,65.732611],[-21.661122,65.755072],[-21.685943,65.769436],[-21.716705,65.776435],[-21.777821,65.768704],[-21.711334,65.754625],[-21.667958,65.727729],[-21.668528,65.707668],[-21.689076,65.69302],[-21.664662,65.681138],[-21.655873,65.662665],[-21.627675,65.648261],[-21.609934,65.641547],[-21.442983,65.643378],[-21.414296,65.637152],[-21.401031,65.624091],[-21.483022,65.569403],[-21.483022,65.562649],[-21.373362,65.59691],[-21.320912,65.601874],[-21.298695,65.558905],[-21.319814,65.522366],[-21.369862,65.487128],[-21.428822,65.461493],[-21.476796,65.453355],[-21.476796,65.446519],[-21.375885,65.462877],[-21.315419,65.480699],[-21.278432,65.473293],[-21.250234,65.453355],[-21.212148,65.438178],[-21.201894,65.428412],[-21.209299,65.411811],[-21.19518,65.408108],[-21.193023,65.40058],[-21.188791,65.340074],[-21.19286,65.310126],[-21.14037,65.247301],[-21.147817,65.241156],[-21.107655,65.215522],[-21.097076,65.19599],[-21.106191,65.172187],[-21.089915,65.166164],[-21.073313,65.172065],[-21.065419,65.185777],[-21.085683,65.233629],[-21.119944,65.267768],[-21.099436,65.28205],[-21.103017,65.290717],[-21.078969,65.308783],[-21.073557,65.324164],[-21.098866,65.445461],[-21.086049,65.459621],[-21.055247,65.452338],[-20.962961,65.353339],[-20.91511,65.343492],[-20.907623,65.35102],[-20.933705,65.37401],[-20.975006,65.437567],[-20.987294,65.506781],[-20.983306,65.521674],[-20.962229,65.54149],[-20.948598,65.57689],[-20.91808,65.601386],[-20.805247,65.638373],[-20.743723,65.672512],[-20.691965,65.683173],[-20.688547,65.69302],[-20.675364,65.693915],[-20.646962,65.679348],[-20.626373,65.679348],[-20.623443,65.670722],[-20.63386,65.665025],[-20.641713,65.604804],[-20.63386,65.589993],[-20.645863,65.573065],[-20.646474,65.55565],[-20.635732,65.545152],[-20.613393,65.548977],[-20.623647,65.567288],[-20.621897,65.583441],[-20.608957,65.590969],[-20.58552,65.583157],[-20.576772,65.576646],[-20.572418,65.555162],[-20.578684,65.535346],[-20.550689,65.52851],[-20.523997,65.501166],[-20.475657,65.49494],[-20.45344,65.501451],[-20.427846,65.548977],[-20.454661,65.566596],[-20.516998,65.570136],[-20.530873,65.57689],[-20.452707,65.585273],[-20.410715,65.596747],[-20.39802,65.587348],[-20.402008,65.542873],[-20.387522,65.52851],[-20.391184,65.544623],[-20.375559,65.568101],[-20.387522,65.583157],[-20.376129,65.596422],[-20.328521,65.627834],[-20.318593,65.65884],[-20.270131,65.665025],[-20.292348,65.666938],[-20.30602,65.679267],[-20.307851,65.693183],[-20.281321,65.703762],[-20.271596,65.714016],[-20.263295,65.744534],[-20.27123,65.770168],[-20.290679,65.793647],[-20.339101,65.822699],[-20.339101,65.830146],[-20.312489,65.840399],[-20.322581,65.869452],[-20.393422,65.946519],[-20.406158,65.997504],[-20.448883,66.029446],[-20.419504,66.054389],[-20.414866,66.070624],[-20.427846,66.083441],[-20.407704,66.090766],[-20.342152,66.090237],[-20.304351,66.103909],[-20.25593,66.103909],[-20.184804,66.131171],[-20.113433,66.12287],[-20.09203,66.131171],[-20.086903,66.109809],[-20.073638,66.097357],[-20.030588,66.083441],[-20.037424,66.075914],[-20.027008,66.071926],[-19.996938,66.03441],[-19.954823,66.001451],[-19.940053,65.97842],[-19.928131,65.974189],[-19.941233,65.960517],[-19.877594,65.92357],[-19.879791,65.905219],[-19.861724,65.898139],[-19.744781,65.882799],[-19.726552,65.871772],[-19.708404,65.87108],[-19.694814,65.843207],[-19.66686,65.815863],[-19.65038,65.76496],[-19.628774,65.752753],[-19.577748,65.746405],[-19.557607,65.733954],[-19.544301,65.762844],[-19.513539,65.761217],[-19.488678,65.748236],[-19.449086,65.747504],[-19.468251,65.737372],[-19.46467,65.729234],[-19.456166,65.728949],[-19.427235,65.739936],[-19.41804,65.753852],[-19.39981,65.81151],[-19.399241,65.836615],[-19.405832,65.860175],[-19.451527,65.925727],[-19.510406,65.95303],[-19.510854,65.96015],[-19.497914,65.977525],[-19.447499,65.987779],[-19.413645,66.007636],[-19.434316,66.02143],[-19.451772,66.052558],[-19.437856,66.066636],[-19.362701,66.088365],[-19.229319,66.097642],[-19.157582,66.081122],[-19.159739,66.097642],[-19.135243,66.104926],[-19.1256,66.103909],[-19.132436,66.090237],[-19.057932,66.07038],[-19.086252,66.088284],[-19.091461,66.097642],[-19.084625,66.097642],[-19.084625,66.103909],[-19.105133,66.111314],[-19.07844,66.158515],[-19.068674,66.164618],[-19.034047,66.177191],[-18.944692,66.19066],[-18.912913,66.184394],[-18.920155,66.152289],[-18.901031,66.155463],[-18.864898,66.185777],[-18.872426,66.199449],[-18.854115,66.20539],[-18.827016,66.203437],[-18.776845,66.193305],[-18.801503,66.156643],[-18.804677,66.14175],[-18.721547,66.172756],[-18.69225,66.169989],[-18.619618,66.131496],[-18.659535,66.090237],[-18.632558,66.091376],[-18.597157,66.10456],[-18.544545,66.08275],[-18.516103,66.029446],[-18.54247,65.98192],[-18.540028,65.974189],[-18.468332,65.966702],[-18.422231,65.954657],[-18.348012,65.950181],[-18.310455,65.922675],[-18.287343,65.915107],[-18.260325,65.872382],[-18.21817,65.867743],[-18.205474,65.847073],[-18.203684,65.807929],[-18.179677,65.782375],[-18.176584,65.733954],[-18.091542,65.69302],[-18.096913,65.679633],[-18.091949,65.661811],[-18.079905,65.64761],[-18.063588,65.645209],[-18.051015,65.65766],[-18.060374,65.694078],[-18.070424,65.706],[-18.105133,65.720282],[-18.109486,65.731594],[-18.097768,65.748236],[-18.097768,65.782375],[-18.070424,65.796047],[-18.064565,65.814602],[-18.067616,65.830552],[-18.097768,65.877916],[-18.100331,65.898749],[-18.118886,65.898383],[-18.151519,65.924791],[-18.161692,65.92357],[-18.173451,65.912095],[-18.217926,65.932074],[-18.228139,65.939399],[-18.218739,65.953559],[-18.222524,65.966986],[-18.235219,65.976996],[-18.264068,65.984849],[-18.296986,66.015082],[-18.28954,66.029446],[-18.316721,66.057359],[-18.329213,66.103949],[-18.323842,66.150784],[-18.296986,66.179633],[-18.193959,66.179633],[-18.142445,66.165961],[-18.084137,66.165961],[-18.091542,66.158515],[-18.054067,66.149563],[-17.955434,66.160142],[-17.91275,66.152289],[-17.885487,66.117499],[-17.816477,66.113267],[-17.784413,66.094468],[-17.752349,66.085395],[-17.713124,66.060289],[-17.672963,66.007066],[-17.623769,65.987209],[-17.549672,65.912095],[-17.545644,65.931138],[-17.577626,65.974189],[-17.535268,65.976264],[-17.495107,65.987779],[-17.586903,65.985785],[-17.611155,65.994045],[-17.452016,65.995185],[-17.440338,65.990383],[-17.419342,65.960517],[-17.413197,65.960517],[-17.406646,65.975002],[-17.419342,65.994045],[-17.395131,66.00609],[-17.388987,66.016343],[-17.391998,66.029446],[-17.364654,66.049262],[-17.364654,66.083441],[-17.352162,66.097113],[-17.261464,66.129706],[-17.254791,66.153144],[-17.269887,66.161526],[-17.264963,66.168647],[-17.217356,66.194241],[-17.156117,66.203681],[-17.145619,66.221177],[-17.119252,66.211127],[-17.018666,66.206936],[-16.992421,66.19953],[-16.933339,66.138617],[-16.933339,66.124335],[-16.947011,66.124335],[-16.947011,66.117499],[-16.92276,66.111029],[-16.898549,66.117499],[-16.919749,66.124335],[-16.884104,66.135321],[-16.758127,66.149604],[-16.721059,66.144843],[-16.753041,66.14289],[-16.782541,66.131171],[-16.75182,66.113186],[-16.712514,66.142483],[-16.700551,66.144843],[-16.672353,66.133694],[-16.629547,66.100816],[-16.596913,66.097642],[-16.596913,66.103909],[-16.655629,66.127753],[-16.667714,66.158515],[-16.686269,66.165961],[-16.531361,66.199164],[-16.508168,66.199449],[-16.596669,66.17829],[-16.624257,66.165961],[-16.515696,66.179633],[-16.452463,66.14643],[-16.426259,66.144843],[-16.426259,66.152289],[-16.461537,66.167182],[-16.48705,66.189521],[-16.472768,66.217678],[-16.439931,66.234198],[-16.440907,66.240139],[-16.421986,66.262397],[-16.421946,66.287095],[-16.454213,66.31745],[-16.476186,66.327338],[-16.480824,66.350287],[-16.508534,66.35932],[-16.51537,66.367336],[-16.508168,66.385077],[-16.52184,66.385077],[-16.508168,66.399319],[-16.529286,66.419176],[-16.508168,66.419176],[-16.508168,66.426011],[-16.525502,66.435736],[-16.544667,66.467597],[-16.572987,66.481024],[-16.563954,66.494818],[-16.543324,66.506985],[-16.52184,66.508531],[-16.512603,66.488837],[-16.501332,66.487494],[-16.48705,66.511054],[-16.429677,66.519843],[-16.43102,66.491604],[-16.411977,66.481269],[-16.419423,66.501125],[-16.364735,66.515367],[-16.327016,66.496161],[-16.30956,66.49494],[-16.330068,66.487494],[-16.312856,66.481269],[-16.268625,66.487494],[-16.268625,66.49494],[-16.235585,66.51789],[-16.226796,66.503892],[-16.215199,66.502183],[-16.204457,66.507961],[-16.196278,66.526842],[-16.165517,66.535875],[-16.0808,66.525946],[-16.022939,66.536607],[-15.93871,66.502672],[-15.891225,66.49494],[-15.933339,66.475491],[-15.939605,66.46015],[-15.925933,66.46015],[-15.925933,66.453925],[-15.946401,66.446479],[-15.925933,66.432807],[-15.937652,66.423814],[-15.830393,66.426011],[-15.836537,66.405504],[-15.741038,66.405504],[-15.706695,66.395901],[-15.697418,66.386868],[-15.699452,66.371405],[-15.679555,66.344062],[-15.721303,66.312405],[-15.775136,66.289455],[-15.761464,66.275214],[-15.749501,66.280666],[-15.690541,66.265774],[-15.687001,66.258694],[-15.699452,66.234198],[-15.683909,66.228746],[-15.610666,66.227362],[-15.575429,66.233954],[-15.548573,66.221177],[-15.528717,66.227362],[-15.520131,66.207709],[-15.510121,66.201646],[-15.419667,66.172309],[-15.38036,66.14997],[-15.35676,66.158515],[-15.371083,66.165961],[-15.353505,66.17121],[-15.332346,66.197943],[-15.329457,66.217475],[-15.33788,66.251776],[-15.331288,66.261461],[-15.302154,66.268378],[-15.179026,66.268378],[-15.108754,66.278388],[-15.09675,66.303127],[-15.02595,66.321845],[-15.007802,66.349107],[-14.991119,66.361314],[-14.925445,66.385321],[-14.839752,66.391832],[-14.75414,66.371405],[-14.563629,66.384508]]],[[[-17.751291,63.717841],[-17.743153,63.703192],[-17.764963,63.681952],[-17.771108,63.680732],[-17.759023,63.690172],[-17.768951,63.69892],[-17.823313,63.691392],[-17.820709,63.699652],[-17.790151,63.713202],[-17.751291,63.717841]]],[[[-18.008941,66.564154],[-17.976308,66.548285],[-17.980458,66.539049],[-17.999827,66.533393],[-18.017201,66.544989],[-18.019521,66.561347],[-18.008941,66.564154]]],[[[-20.261871,63.444648],[-20.252553,63.429511],[-20.269643,63.409125],[-20.27953,63.402737],[-20.286773,63.40648],[-20.305572,63.43476],[-20.302602,63.44595],[-20.25886,63.451361],[-20.261871,63.444648]]],[[[-18.408559,66.027411],[-18.35676,65.993232],[-18.35676,65.981635],[-18.369944,65.978013],[-18.390492,65.983466],[-18.414418,66.023668],[-18.408559,66.027411]]]]},
+  glaciers: {"type":"MultiPolygon","coordinates":[[[[-19.514719,63.583808],[-19.559071,63.596503],[-19.630238,63.585191],[-19.704498,63.610663],[-19.732574,63.644843],[-19.720937,63.663886],[-19.686269,63.653754],[-19.616322,63.679185],[-19.584543,63.666449],[-19.552724,63.672797],[-19.520985,63.660102],[-19.444692,63.653754],[-19.433217,63.643378],[-19.381215,63.662177],[-19.356435,63.692206],[-19.330393,63.698228],[-19.309641,63.718695],[-19.330393,63.736396],[-19.324045,63.755439],[-19.266754,63.761786],[-19.215972,63.793606],[-19.037994,63.812649],[-18.922434,63.794867],[-18.829579,63.745551],[-18.815541,63.731391],[-18.815541,63.717353],[-18.87914,63.704535],[-18.869374,63.691107],[-18.820424,63.689927],[-18.802805,63.679185],[-18.84732,63.647406],[-18.843739,63.636664],[-18.828236,63.621975],[-18.767201,63.607123],[-18.758372,63.590237],[-18.776235,63.565253],[-18.82433,63.550482],[-18.942698,63.558417],[-19.044423,63.533026],[-19.16511,63.545722],[-19.222279,63.526597],[-19.227162,63.550442],[-19.254709,63.561103],[-19.28539,63.556342],[-19.335764,63.525458],[-19.348012,63.538886],[-19.324045,63.571112],[-19.432729,63.621812],[-19.476552,63.596503],[-19.501943,63.596503],[-19.514719,63.583808]]],[[[-19.560129,63.826565],[-19.508372,63.799994],[-19.511301,63.791653],[-19.590891,63.774482],[-19.622914,63.785549],[-19.635406,63.806342],[-19.560129,63.826565]]],[[[-19.883209,64.651557],[-19.902333,64.626166],[-19.877187,64.59634],[-19.887563,64.579901],[-19.953236,64.575344],[-20.023061,64.543524],[-20.11852,64.530829],[-20.14387,64.511786],[-20.181956,64.511786],[-20.24592,64.47602],[-20.277415,64.479967],[-20.306386,64.5397],[-20.334462,64.543524],[-20.353586,64.537177],[-20.353586,64.492662],[-20.375234,64.475979],[-20.439565,64.46955],[-20.506093,64.505439],[-20.525217,64.549954],[-20.563344,64.556301],[-20.595082,64.575344],[-20.616078,64.563544],[-20.640736,64.526068],[-20.671376,64.518052],[-20.766591,64.519924],[-20.785797,64.530829],[-20.778798,64.547065],[-20.71817,64.571438],[-20.652252,64.568996],[-20.642568,64.579495],[-20.660064,64.595852],[-20.658599,64.613471],[-20.476308,64.700019],[-20.353586,64.721503],[-20.264801,64.715481],[-20.251943,64.734198],[-20.255523,64.747301],[-20.241526,64.757961],[-20.175608,64.772366],[-20.11852,64.772366],[-20.098785,64.789618],[-20.061187,64.854926],[-19.978668,64.893052],[-19.825266,64.906724],[-19.776682,64.896226],[-19.749827,64.867662],[-19.743479,64.835883],[-19.781606,64.810492],[-19.762522,64.785061],[-19.794301,64.753323],[-19.794301,64.727851],[-19.876861,64.696112],[-19.883209,64.651557]]],[[[-20.34081,64.75967],[-20.366282,64.746975],[-20.406728,64.745266],[-20.434926,64.757066],[-20.423573,64.785061],[-20.366322,64.804145],[-20.34081,64.75967]]],[[[-22.144765,66.200995],[-22.139516,66.176947],[-22.122426,66.152289],[-22.075999,66.138861],[-22.031402,66.100653],[-22.049306,66.081692],[-22.090321,66.067369],[-22.138499,66.061754],[-22.177602,66.068915],[-22.21581,66.100653],[-22.285756,66.11343],[-22.431956,66.189683],[-22.395416,66.215033],[-22.291371,66.234076],[-22.234853,66.227769],[-22.203033,66.208726],[-22.145863,66.215074],[-22.138254,66.210028],[-22.144765,66.200995]]],[[[-16.72704,64.687161],[-16.679067,64.691596],[-16.661,64.70246],[-16.64802,64.729071],[-16.631459,64.733303],[-16.565663,64.689765],[-16.566274,64.675849],[-16.591054,64.645209],[-16.571156,64.641181],[-16.489369,64.670722],[-16.470326,64.689765],[-16.406809,64.721503],[-16.298695,64.740627],[-16.203359,64.785061],[-16.13976,64.791449],[-16.057118,64.765937],[-15.980865,64.765937],[-15.955556,64.740627],[-15.923695,64.740627],[-15.904652,64.715155],[-15.824615,64.721991],[-15.771148,64.715155],[-15.748362,64.684394],[-15.720082,64.672268],[-15.663197,64.670722],[-15.542348,64.721503],[-15.494537,64.717231],[-15.478383,64.705878],[-15.49706,64.689765],[-15.490834,64.666205],[-15.466135,64.677069],[-15.434316,64.664374],[-15.377105,64.677069],[-15.3072,64.657904],[-15.221995,64.608059],[-15.21817,64.587958],[-15.256337,64.587958],[-15.288157,64.556301],[-15.288157,64.537177],[-15.324045,64.532945],[-15.332672,64.5244],[-15.315582,64.499091],[-15.319936,64.492662],[-15.383453,64.505439],[-15.500071,64.498725],[-15.504628,64.475775],[-15.447011,64.467231],[-15.42634,64.44831],[-15.408844,64.422838],[-15.4204,64.41059],[-15.491567,64.416449],[-15.574452,64.471015],[-15.604075,64.468736],[-15.60554,64.449937],[-15.569081,64.440172],[-15.577382,64.420966],[-15.624989,64.429185],[-15.6551,64.411933],[-15.663197,64.397284],[-15.580434,64.352851],[-15.538482,64.340725],[-15.536,64.32746],[-15.576527,64.311021],[-15.59317,64.308417],[-15.631337,64.333808],[-15.669504,64.340237],[-15.701243,64.365546],[-15.758453,64.359198],[-15.796376,64.371772],[-15.847483,64.368354],[-15.853831,64.359198],[-15.848459,64.345038],[-15.832834,64.339301],[-15.790273,64.333808],[-15.745717,64.314765],[-15.663726,64.305487],[-15.650543,64.286851],[-15.669504,64.257554],[-15.713938,64.263861],[-15.79662,64.238471],[-15.841054,64.257554],[-15.913645,64.237006],[-15.942779,64.238471],[-15.961781,64.251166],[-16.095326,64.263861],[-16.120758,64.251166],[-16.152455,64.251166],[-16.15099,64.2355],[-16.095326,64.213039],[-16.113678,64.1706],[-16.141225,64.15998],[-16.193756,64.168402],[-16.228749,64.200344],[-16.248199,64.206],[-16.257802,64.196763],[-16.257639,64.17829],[-16.241933,64.148871],[-16.152496,64.126125],[-16.147817,64.096422],[-16.15803,64.081855],[-16.196929,64.060533],[-16.364573,64.05268],[-16.3815,64.035712],[-16.378977,64.012763],[-16.387685,64.003363],[-16.503326,63.992377],[-16.51476,63.971584],[-16.466298,63.955878],[-16.475901,63.940497],[-16.533844,63.958808],[-16.641835,63.939765],[-16.680043,63.95246],[-16.719594,63.949164],[-16.800771,63.977932],[-16.788075,64.016018],[-16.866363,64.001695],[-16.869293,64.008979],[-16.845286,64.022366],[-16.799184,64.036119],[-16.801503,64.066962],[-16.775299,64.076117],[-16.787099,64.080715],[-16.822743,64.070543],[-16.883453,64.016018],[-16.926503,64.012641],[-16.930531,64.035061],[-16.870717,64.085883],[-16.940663,64.079576],[-16.949452,64.087307],[-16.924306,64.099433],[-16.921539,64.111396],[-16.953481,64.119208],[-17.161855,64.098538],[-17.170481,64.085517],[-17.124867,64.060533],[-17.11852,64.047838],[-17.079091,64.049018],[-17.074086,64.041449],[-17.082346,64.018052],[-17.112172,63.996975],[-17.305287,63.978746],[-17.430002,64.003363],[-17.426503,64.015082],[-17.353749,64.060533],[-17.353749,64.092231],[-17.341054,64.12401],[-17.344472,64.155951],[-17.334096,64.182318],[-17.351308,64.203111],[-17.417348,64.219184],[-17.541371,64.204535],[-17.576161,64.18769],[-17.623769,64.180976],[-17.658803,64.181301],[-17.707753,64.200507],[-17.72232,64.193996],[-17.718129,64.181627],[-17.683583,64.156806],[-17.690582,64.136786],[-17.709625,64.130439],[-17.741363,64.092231],[-17.798695,64.079576],[-17.88622,64.082465],[-17.963938,64.0987],[-18.030629,64.127834],[-18.04011,64.136786],[-18.033762,64.174954],[-18.084625,64.18769],[-18.103749,64.232123],[-18.15453,64.232123],[-18.209788,64.298041],[-18.194203,64.324368],[-18.139068,64.366278],[-18.052846,64.391018],[-17.960357,64.480455],[-17.932118,64.492662],[-17.933583,64.504584],[-17.963938,64.518052],[-17.989369,64.543524],[-17.919423,64.600775],[-17.845855,64.631537],[-17.777089,64.643378],[-17.690582,64.626166],[-17.652455,64.657904],[-17.633412,64.651557],[-17.538075,64.727851],[-17.506215,64.715155],[-17.461781,64.746975],[-17.33434,64.783637],[-17.1822,64.772366],[-17.137603,64.804145],[-17.080434,64.810492],[-17.036,64.829535],[-16.920033,64.834052],[-16.864369,64.810492],[-16.83259,64.829535],[-16.772206,64.835639],[-16.704823,64.827297],[-16.650461,64.805732],[-16.629221,64.772366],[-16.635487,64.755683],[-16.737294,64.70246],[-16.72704,64.687161]],[[-16.407338,64.192939],[-16.40038,64.200344],[-16.403798,64.220038],[-16.476674,64.244818],[-16.476674,64.257554],[-16.506215,64.261949],[-16.536488,64.254096],[-16.539662,64.232978],[-16.51476,64.193996],[-16.493479,64.190823],[-16.444936,64.206692],[-16.407338,64.192939]]],[[[-14.86974,64.728502],[-14.842885,64.71308],[-14.836903,64.689765],[-14.867828,64.668158],[-14.914174,64.674954],[-14.945709,64.698635],[-14.93224,64.727851],[-14.86974,64.728502]]],[[[-17.944081,64.711819],[-17.982981,64.721503],[-17.976308,64.754218],[-17.951243,64.778713],[-17.795806,64.790025],[-17.792226,64.767483],[-17.855784,64.740627],[-17.881215,64.715155],[-17.944081,64.711819]]],[[[-18.567738,64.956692],[-18.535878,64.924954],[-18.455881,64.898383],[-18.478627,64.867662],[-18.47232,64.852688],[-18.434234,64.835883],[-18.459584,64.797756],[-18.459584,64.765937],[-18.503245,64.725531],[-18.56135,64.696112],[-18.637522,64.708726],[-18.680043,64.694525],[-18.686879,64.679999],[-18.650258,64.664374],[-18.660227,64.650295],[-18.688466,64.638861],[-18.739247,64.651557],[-18.770985,64.645209],[-18.817779,64.68065],[-18.833608,64.682929],[-18.853668,64.677069],[-18.898183,64.638861],[-18.94933,64.634711],[-18.99352,64.651557],[-19.025258,64.683417],[-19.088857,64.696112],[-19.107818,64.715155],[-19.152415,64.708726],[-19.178822,64.747056],[-19.181467,64.774604],[-19.158762,64.810492],[-19.170277,64.855862],[-19.16511,64.867662],[-19.07608,64.874091],[-19.035634,64.895453],[-19.028066,64.944281],[-19.001698,64.960761],[-18.758372,64.969306],[-18.682037,64.950344],[-18.621246,64.967231],[-18.593129,64.963039],[-18.567738,64.956692]]],[[[-18.886586,65.701239],[-18.789622,65.693671],[-18.807037,65.638251],[-18.828236,65.624091],[-18.828236,65.604926],[-18.910878,65.624091],[-18.87267,65.654853],[-18.917388,65.694281],[-18.886586,65.701239]]]]},
+  roads: {"type":"MultiLineString","coordinates":[[[-23.488582,65.63002],[-23.376675,65.623475],[-23.258022,65.644636]],[[-21.795394,64.125362],[-21.791284831072087,64.12415049923204]],[[-21.791284831072087,64.12415049923204],[-21.596258,64.066651],[-21.503737,64.065207],[-21.428152663998794,64.03566105792264]],[[-21.428152663998794,64.03566105792264],[-21.407206,64.027473],[-21.287068,64.018376],[-21.21101382239231,63.996837070767576]],[[-21.21101382239231,63.996837070767576],[-21.103971,63.966522],[-21.005580985987198,63.957993651884365]],[[-21.005580985987198,63.957993651884365],[-20.998298563010543,63.95736241873644]],[[-20.998298563010543,63.95736241873644],[-20.985061,63.956215],[-20.713815,63.960855],[-20.633978,63.914246]],[[-20.633978,63.914246],[-20.600267,63.897798],[-20.487223,63.878099],[-20.27191,63.786204],[-20.194677,63.702852],[-20.083798,63.667627],[-19.960504,63.600644]],[[-19.960504,63.600644],[-19.855554,63.569896],[-19.460462,63.511949],[-19.28413,63.4763],[-19.182095,63.432765],[-19.092107,63.445485],[-19.05153,63.425243],[-18.999611,63.417286],[-18.608773,63.452243],[-18.496313,63.502533],[-18.45797,63.528387],[-18.442949,63.551593]],[[-18.442949,63.551593],[-18.450645,63.599815],[-18.442592,63.624555],[-18.424326181304306,63.643871303350394]],[[-18.424326181304306,63.643871303350394],[-18.408129,63.661],[-18.363848,63.686437],[-18.046213,63.782094],[-17.942835,63.837938],[-17.497453,63.942518],[-17.271363,63.947546],[-16.986989,63.986444],[-16.920091,64.007943],[-16.891881,63.99956],[-16.850555,63.95284],[-16.810297,63.950527],[-16.780368,63.924279],[-16.733187,63.913318],[-16.693316,63.88761],[-16.663387,63.879997]],[[-16.663387,63.879997],[-16.42885,63.956515],[-16.394565,63.980412],[-16.340375,64.041083],[-16.29676,64.05963],[-16.139845,64.088165],[-15.852353,64.182851],[-15.741181,64.194483],[-15.667195,64.240109],[-15.479094,64.278858],[-15.454498,64.299229],[-15.45313,64.31551],[-15.473963,64.347638],[-15.540156,64.382452],[-15.540162,64.400507],[-15.514902,64.417613],[-15.412922,64.407685],[-15.346711,64.388665],[-15.200927,64.32342],[-15.055584,64.300305],[-14.983998,64.307927],[-14.922773,64.333092],[-14.924251,64.387766],[-14.916814,64.404984],[-14.887838,64.423109],[-14.769272,64.423225],[-14.58324,64.441726],[-14.555479,64.458159],[-14.540838,64.497208],[-14.551949,64.51969],[-14.605535,64.550415],[-14.598269,64.579309],[-14.549838,64.600656],[-14.417625,64.592431],[-14.415405,64.612291],[-14.427418,64.627216],[-14.485782,64.642374],[-14.492244,64.660922],[-14.467279,64.666303],[-14.390074,64.65426],[-14.359307,64.666957],[-14.502899,64.7843],[-14.509081,64.805618],[-14.486772,64.826645],[-14.44544,64.826173],[-14.351774,64.756104],[-14.264627,64.720837],[-14.191231,64.711055],[-14.099213,64.722964],[-14.081657,64.744273],[-14.082694,64.772067],[-14.101024,64.799773],[-14.105415714194914,64.80245505850438]],[[-14.105415714194914,64.80245505850438],[-14.128366,64.816471],[-14.33767,64.843565],[-14.538622,64.901188],[-14.620812,64.905242],[-14.650663,64.927223],[-14.649274,64.952739],[-14.603606,65.017301],[-14.569464,65.111928],[-14.522471,65.158958],[-14.513329261732554,65.17277100223964]],[[-14.513329261732554,65.17277100223964],[-14.47289,65.233874],[-14.400395548235611,65.26907657846652]],[[-14.400395548235611,65.26907657846652],[-14.392911,65.272711]],[[-14.389455,65.265804],[-14.389498523087367,65.2658170187917]],[[-14.389498523087367,65.2658170187917],[-14.400395548235611,65.26907657846652]],[[-14.400395548235611,65.26907657846652],[-14.415705,65.273656],[-14.430295792519203,65.28422844510898]],[[-14.430295792519203,65.28422844510898],[-14.465276,65.309575],[-14.586616,65.421899],[-14.631175364308682,65.43679971212019]],[[-14.631175364308682,65.43679971212019],[-14.651221,65.443503],[-14.75477,65.421126],[-15.10525,65.380749],[-15.151887,65.364468],[-15.2363,65.30588],[-15.272921099995486,65.29566645547443]],[[-15.272921099995486,65.29566645547443],[-15.285257,65.292226],[-15.322673,65.299165],[-15.328344699980834,65.30267800782696]],[[-15.328344699980834,65.30267800782696],[-15.37129,65.329278],[-15.460494,65.430874],[-15.505343487747458,65.45621087610341]],[[-15.505343487747458,65.45621087610341],[-15.51124,65.459542],[-15.651994,65.465425],[-15.824756,65.443372],[-15.953744,65.446166],[-15.965571,65.501707],[-15.995695,65.543524],[-16.044047,65.57051],[-16.137927,65.599306],[-16.175084,65.626628],[-16.223119,65.608532],[-16.331891,65.6408],[-16.438626,65.650049],[-16.671605,65.645968],[-16.862551,65.658044],[-16.913097,65.641208],[-16.957176,65.555868],[-16.986211,65.541421],[-17.172762,65.600354],[-17.22553,65.63186],[-17.321827,65.659925],[-17.362921,65.709139],[-17.395435,65.723411],[-17.4523,65.722833],[-17.544814,65.691079],[-17.62177764588094,65.6966709708841]],[[-17.62177764588094,65.6966709708841],[-17.622769,65.696743]],[[-17.622769,65.696743],[-17.702975,65.715728],[-17.795251,65.721095],[-17.9054,65.75817],[-17.960474,65.805144],[-18.015449,65.822233],[-18.041784,65.815069],[-18.066136,65.777064],[-18.062806,65.746383],[-18.023881,65.680275],[-18.023808,65.654818],[-18.058084,65.617711],[-18.083582,65.616784],[-18.09117323956015,65.62134750443232]],[[-18.09117323956015,65.62134750443232],[-18.115123,65.635745],[-18.229745,65.760786],[-18.291289,65.769586],[-18.381591,65.731651],[-18.508477,65.634923],[-18.661762,65.493907],[-18.70228,65.472516],[-18.746895,65.461908],[-18.912256,65.45851],[-19.087488,65.420925],[-19.138878,65.424247],[-19.247602,65.469243],[-19.347726,65.544632],[-19.457946,65.562701],[-19.462489163160583,65.56100894400166]],[[-19.462489163160583,65.56100894400166],[-19.568447,65.521546],[-19.718776,65.513327],[-19.847449235761754,65.54064137390364]],[[-19.847449235761754,65.54064137390364],[-20.043333,65.582223],[-20.183119,65.65058],[-20.240128670712195,65.66152600848581]],[[-20.240128670712195,65.66152600848581],[-20.240238,65.661547]],[[-20.240238,65.661547],[-20.286815,65.65095],[-20.305939,65.637297],[-20.329259,65.601272],[-20.345041,65.530909],[-20.35805,65.516028],[-20.580889,65.454476],[-20.62131,65.428001],[-20.66676,65.358486],[-20.733806,65.346352],[-20.736492996648657,65.34637034027068]],[[-20.736492996648657,65.34637034027068],[-20.852624,65.347163],[-21.042497,65.287347],[-21.054193,65.261601],[-21.07602,65.109449],[-21.052734,64.999643],[-21.062049,64.948547],[-21.094342,64.931519],[-21.152484,64.934419],[-21.182993,64.916113],[-21.223172,64.854972],[-21.253831,64.836466],[-21.36616,64.838951],[-21.455093,64.801829],[-21.515508,64.789174],[-21.673858,64.682281],[-21.871448,64.588132],[-21.897286,64.563835],[-21.89510452699867,64.53976862161727]],[[-21.89510452699867,64.53976862161727],[-21.894395,64.531941]],[[-21.772399,64.133377],[-21.71144,64.154809],[-21.701458,64.174451],[-21.72323,64.208714],[-21.793614,64.222592],[-21.830717,64.242501],[-21.837326,64.265503],[-21.805442,64.299783],[-21.735183,64.336866],[-21.637633,64.33],[-21.634396,64.352413],[-21.616836,64.371727],[-21.590245,64.378605],[-21.435438,64.353422],[-21.402989,64.360542],[-21.382227,64.381525],[-21.419008,64.39631],[-21.609076,64.411287],[-21.787403,64.395948],[-21.838282766276517,64.4004152490657]],[[-21.838282766276517,64.4004152490657],[-21.936765,64.409062],[-21.963942,64.429572],[-21.96845,64.45932],[-21.901959,64.52441],[-21.899331,64.541814]],[[-22.205398,65.780897],[-22.156071,65.748506],[-22.027713,65.689792],[-22.097557,65.635168]],[[-22.097557,65.635168],[-22.118687,65.585082],[-22.103672,65.550052],[-22.075267,65.534502],[-21.995778,65.525662],[-21.95595,65.507578],[-21.913719,65.462357],[-21.875409,65.385127],[-21.785445,65.358232],[-21.754686,65.334017],[-21.749562,65.304987],[-21.768877,65.246422],[-21.754623,65.220556],[-21.709616,65.182907],[-21.720026,65.153016],[-21.761431,65.117152],[-21.76229,65.097639],[-21.734114,65.066086],[-21.704691887290437,65.0465253284558]],[[-21.704691887290437,65.0465253284558],[-21.565066,64.953698],[-21.467086,64.806167]],[[-22.205398,65.780897],[-22.300106,65.831342],[-22.337858,65.86648],[-22.353512,65.900681]],[[-13.98923,65.266375],[-14.146614,65.242184],[-14.31702,65.277844],[-14.370874,65.264865]],[[-13.864506,65.482593],[-13.871038,65.527593],[-13.891681,65.547333],[-13.917296,65.555701],[-13.999484,65.563877],[-14.088601,65.58619],[-14.215353,65.586251],[-14.27656,65.56892]],[[-14.27656,65.56892],[-14.315075,65.535453],[-14.338507,65.485778],[-14.389498523087367,65.2658170187917]],[[-14.389498523087367,65.2658170187917],[-14.389891,65.264124]],[[-14.298612,65.032109],[-14.29186134554887,65.03187363878217]],[[-14.29186134554887,65.03187363878217],[-14.243485,65.030187],[-14.053375,65.057779],[-13.93815,65.062081],[-13.872443,65.081244],[-13.787756,65.12585],[-13.667178,65.14139]],[[-21.880213,64.531387],[-21.89510452699867,64.53976862161727]],[[-21.89510452699867,64.53976862161727],[-21.996515,64.596847]],[[-15.184463,64.287594],[-15.218864,64.246319]],[[-21.840321,64.267054],[-21.846718,64.288755],[-21.864887,64.300358],[-22.004775,64.303697],[-22.026426,64.312442],[-22.034939,64.327979],[-22.015373,64.352211],[-21.987098,64.364345],[-21.867421,64.371307],[-21.838282766276517,64.4004152490657]],[[-21.838282766276517,64.4004152490657],[-21.833409,64.405284]],[[-19.697746,65.752709],[-19.68942112767341,65.74727505442193]],[[-19.68942112767341,65.74727505442193],[-19.538383,65.648687],[-19.502471,65.587097]],[[-16.905332,65.649399],[-17.000972,65.683434],[-17.113515,65.747608],[-17.272145,65.809866],[-17.320089,65.855101],[-17.327006,65.886518],[-17.316503,65.941711],[-17.343663,65.964593],[-17.366073398156555,65.97050930378121]],[[-17.366073398156555,65.97050930378121],[-17.378364,65.973754],[-17.429558,65.965089],[-17.448711,65.94412],[-17.445121,65.892835],[-17.488274,65.889679],[-17.502054,65.846926],[-17.55768,65.828895],[-17.573527,65.814477],[-17.62177764588094,65.6966709708841]],[[-17.62177764588094,65.6966709708841],[-17.624154,65.690869]],[[-22.711201,64.028593],[-22.697857,64.050924],[-22.672152,64.051971],[-22.621566,64.026563],[-22.555961,63.974135],[-22.523253,63.961972],[-22.345154,63.962798],[-22.058299,64.019438],[-21.934538,64.06549],[-21.879461,64.111475],[-21.791284831072087,64.12415049923204]],[[-21.791284831072087,64.12415049923204],[-21.750308,64.130041]],[[-21.944958,64.059415],[-21.934159,64.038245],[-21.955115,63.958186],[-22.034153,63.915351],[-22.057942,63.890815]],[[-22.057942,63.890815],[-22.054117,63.861044],[-22.018627,63.846875],[-21.7113,63.866674],[-21.644965,63.829684],[-21.539632,63.83267],[-21.477817,63.842039],[-21.392675,63.874855],[-21.371243894273846,63.88888920044099]],[[-21.371243894273846,63.88888920044099],[-21.36837825832728,63.89076576760365]],[[-21.36837825832728,63.89076576760365],[-21.36212,63.894864],[-21.339195,63.926581],[-21.238967,63.964644],[-21.21101382239231,63.996837070767576]],[[-21.21101382239231,63.996837070767576],[-21.20444,64.004408]],[[-21.42216,64.042422],[-21.428152663998794,64.03566105792264]],[[-21.428152663998794,64.03566105792264],[-21.460014,63.999715],[-21.462295,63.974368],[-21.445819,63.954704],[-21.380259,63.941441],[-21.37152524590702,63.89052928488163]],[[-21.37152524590702,63.89052928488163],[-21.371243894273846,63.88888920044099]],[[-21.371243894273846,63.88888920044099],[-21.369585,63.879219]],[[-20.679147,63.959481],[-20.583272,63.985607],[-20.501451,64.030638],[-20.348488,64.063962],[-20.321066,64.092642],[-20.320074841618055,64.13762792159851]],[[-20.320074841618055,64.13762792159851],[-20.319736,64.153007]],[[-21.007455,63.952563],[-21.005580985987198,63.957993651884365]],[[-21.005580985987198,63.957993651884365],[-21.004496459191483,63.961136471226474]],[[-21.004496459191483,63.961136471226474],[-20.991387,63.999126],[-20.975452,64.011303],[-20.949832255734417,64.0202814777588]],[[-20.949832255734417,64.0202814777588],[-20.719194,64.101109],[-20.708116,64.13917],[-20.746496,64.20321]],[[-21.688262,64.184114],[-21.572602,64.178479],[-21.420585,64.213999],[-21.251268,64.22188],[-21.183216,64.241895],[-21.12002,64.27859],[-21.091544218203754,64.27960867809026]],[[-21.091544218203754,64.27960867809026],[-21.089858,64.279669],[-21.051219,64.267253],[-21.038249,64.253515],[-21.045782,64.222988],[-21.035862,64.205934],[-21.035895721757008,64.19801836735375]],[[-21.035895721757008,64.19801836735375],[-21.036046,64.162743],[-21.024189,64.121707],[-21.003788,64.087611],[-20.975439,64.066951],[-20.949832255734417,64.0202814777588]],[[-20.949832255734417,64.0202814777588],[-20.948705,64.018227]],[[-21.391057,64.671387],[-21.455874,64.6305],[-21.532347,64.617696],[-21.595026,64.583792],[-21.715168743370246,64.55357923878462]],[[-21.715168743370246,64.55357923878462],[-21.807561,64.530345],[-21.888703,64.526244]],[[-21.996515,64.596847],[-22.059859,64.630451],[-22.080148,64.691629],[-22.165342,64.711539],[-22.233415,64.748692],[-22.285191,64.832761],[-22.325171,64.848346],[-22.434153,64.84899],[-22.491269,64.819893],[-22.567809,64.84185],[-22.734601,64.850758],[-22.870136,64.834864],[-22.95298,64.845324],[-23.0501,64.802626],[-23.360906,64.837268]],[[-20.876132,65.340455],[-20.921733,65.371229],[-20.957412,65.415698],[-20.97535,65.468602],[-20.970186,65.501695],[-20.929429,65.566368],[-20.898306,65.594141],[-20.823552,65.611895],[-20.717841,65.654856],[-20.678126,65.657519],[-20.662234,65.650335],[-20.649639,65.623057],[-20.650809,65.527811],[-20.692718,65.483197],[-20.702026,65.41055],[-20.736492996648657,65.34637034027068]],[[-20.736492996648657,65.34637034027068],[-20.737897,65.343756]],[[-20.219516,65.725432],[-20.216612432876364,65.72617005844354]],[[-20.216612432876364,65.72617005844354],[-19.951811,65.79348],[-19.879607159518606,65.82329955663089]],[[-19.879607159518606,65.82329955663089],[-19.873928,65.825645]],[[-22.42782,63.956022],[-22.432285,63.841966],[-22.061497,63.862716]],[[-21.373778,63.89036],[-21.37152524590702,63.89052928488163]],[[-21.37152524590702,63.89052928488163],[-21.36837825832728,63.89076576760365]],[[-21.36837825832728,63.89076576760365],[-21.275489,63.897746],[-21.002819,63.819959],[-20.945506,63.815502],[-20.918513,63.823334],[-20.896956,63.859128],[-20.909346,63.903197],[-20.998298563010543,63.95736241873644]],[[-20.998298563010543,63.95736241873644],[-21.004496459191483,63.961136471226474]],[[-21.004496459191483,63.961136471226474],[-21.007455,63.962938]],[[-20.43378,64.049331],[-20.495811,64.09175],[-20.523034,64.136069],[-20.56104976888319,64.15137507082041]],[[-20.56104976888319,64.15137507082041],[-20.565103,64.153007]],[[-20.495985,64.184114],[-20.487162,64.197648],[-20.527447764441842,64.24926210431613]],[[-20.527447764441842,64.24926210431613],[-20.530544,64.253229]],[[-20.713706,64.108083],[-20.607254,64.127777],[-20.56104976888319,64.15137507082041]],[[-20.56104976888319,64.15137507082041],[-20.513859,64.175477],[-20.421329,64.197117],[-20.379569,64.187515],[-20.337197,64.146193],[-20.320074841618055,64.13762792159851]],[[-20.320074841618055,64.13762792159851],[-20.309368,64.132272]],[[-20.392309,64.049331],[-20.318275,64.032082],[-20.116119,64.035521],[-20.065774,64.047427],[-19.906013,64.118639],[-19.755637,64.12456],[-19.63072,64.150983],[-19.463061,64.146686],[-19.23974,64.180337],[-19.180273,64.20484]],[[-22.78264,65.015933],[-22.767063297096225,65.01197236592387]],[[-22.767063297096225,65.01197236592387],[-22.573922,64.962863],[-22.538048,64.970122],[-22.565784,65.003884],[-22.546691,65.022355],[-22.518989,65.029945],[-22.435096,65.033331],[-22.21812014918514,65.01367213422111]],[[-22.21812014918514,65.01367213422111],[-22.217026,65.013573]],[[-22.120246,65.590653],[-22.220467,65.566114],[-22.279861,65.574917],[-22.354616,65.558463],[-22.420385,65.559026],[-22.430025,65.526268],[-22.459519,65.511352],[-22.484072,65.529063],[-22.509862,65.630941],[-22.56329,65.65921],[-22.587286,65.659295],[-22.682817,65.627354],[-22.769428,65.631598],[-22.770214,65.609626],[-22.782414,65.601797],[-22.805828,65.60465],[-22.851558,65.6299],[-22.871705,65.593176],[-22.89078,65.579969],[-22.919351,65.585014],[-22.956747,65.611971],[-22.972562,65.559723],[-22.998958,65.53762],[-23.087854,65.549077],[-23.138401,65.590195],[-23.174288,65.590653]],[[-23.174288,65.580284],[-23.191817,65.562462],[-23.193297,65.508654],[-23.211526,65.49153],[-23.306086,65.494225],[-23.403311,65.520452],[-23.491379,65.486388],[-23.575158,65.469538],[-23.642411,65.480995],[-23.763928,65.53559],[-23.884473,65.550889],[-23.910357,65.568952],[-23.888108,65.59018],[-23.7789,65.599724],[-23.729983,65.643028],[-23.62986,65.676431],[-23.612507,65.67357],[-23.600624,65.658837],[-23.596986,65.605472],[-23.572556,65.581789],[-23.525602,65.592149],[-23.488582,65.63002]],[[-22.309413,64.842941],[-22.239611,64.861821],[-22.216314,64.884749],[-22.215805,64.911755],[-22.24017,64.987599],[-22.227433,65.012243]],[[-22.227433,65.012243],[-22.21812014918514,65.01367213422111]],[[-22.21812014918514,65.01367213422111],[-22.14949,65.024204],[-21.984471,65.010957],[-21.830958,65.018867],[-21.704691887290437,65.0465253284558]],[[-21.704691887290437,65.0465253284558],[-21.701306,65.047267]],[[-21.088706,65.089434],[-21.108701,65.131517],[-21.20197795868994,65.26461791754339]],[[-21.20197795868994,65.26461791754339],[-21.206789,65.271483],[-21.230753,65.38525],[-21.24982,65.428374],[-21.284203,65.447248],[-21.391013,65.439758],[-21.446764,65.452417],[-21.349369,65.499449],[-21.322514,65.522798],[-21.321222,65.554444],[-21.346154,65.577005],[-21.391757,65.582424],[-21.474722,65.524241],[-21.496673,65.520776],[-21.511362,65.546079],[-21.453366,65.577918],[-21.459406,65.601223],[-21.502481,65.619869],[-21.621903,65.616401],[-21.656471,65.62484],[-21.689139,65.656935],[-21.732136131213256,65.74192306916466]],[[-21.732136131213256,65.74192306916466],[-21.732427,65.742498],[-21.759922,65.759774],[-21.793382087857257,65.76304701489364]],[[-21.793382087857257,65.76304701489364],[-21.79421,65.763128],[-22.026413,65.737152],[-22.140427,65.754142],[-22.19282,65.777268]],[[-19.051431,66.039915],[-19.05168668609848,66.0418170798623]],[[-19.05168668609848,66.0418170798623],[-19.054708,66.064293],[-19.082527,66.099612],[-19.084706,66.118967],[-19.06956,66.143896],[-19.0358,66.164847],[-18.988081,66.171025],[-18.961926,66.158687],[-18.943401,66.122251],[-18.942743,66.080507]],[[-21.715172,65.142679],[-21.409983,65.23425],[-21.284094,65.241697],[-21.20197795868994,65.26461791754339]],[[-21.20197795868994,65.26461791754339],[-21.201168,65.264844]],[[-23.1812,65.576827],[-23.251001,65.632248],[-23.258814,65.651472],[-23.245899,65.667036],[-23.20252,65.678353],[-23.209154,65.707494],[-23.181704,65.73252],[-23.178805,65.768028],[-23.201573,65.775486],[-23.429067,65.754882],[-23.464884,65.760509],[-23.437718,65.827547],[-23.406021,65.839179],[-23.337026,65.840022],[-23.315272,65.85775],[-23.321989,65.872628],[-23.351705,65.883616],[-23.442696,65.886894],[-23.456340300539534,65.89915820738547]],[[-23.456340300539534,65.89915820738547],[-23.458376,65.900988],[-23.460935,65.922408]],[[-23.45582,65.933078],[-23.449327,65.959675],[-23.427772,65.976406],[-23.332942,65.993504],[-23.212798,66.063281],[-23.125622,66.075088],[-23.041401,66.106839],[-23.004742,66.09444],[-22.993583,66.080411],[-22.994285,66.059556],[-23.080135,65.975373],[-23.050162,65.970881],[-22.987161,66.017269],[-22.953801,66.018488],[-22.937397,66.007717],[-22.932198,65.989671],[-22.97696,65.926748],[-22.939049,65.925205],[-22.847636,65.980839],[-22.854383,65.911348],[-22.843861,65.893541],[-22.81718,65.910998],[-22.777145,65.961148],[-22.765002,66.023491],[-22.70152,66.018978],[-22.638292,65.995239],[-22.623325,65.9613],[-22.672151,65.847174],[-22.664237,65.825578],[-22.645437,65.815256],[-22.615079,65.824412],[-22.55092,65.897044],[-22.515273,65.92013],[-22.485317,65.904132],[-22.478984,65.879372],[-22.535426,65.801708],[-22.513549,65.795101],[-22.47682,65.802831],[-22.430365,65.829271],[-22.382088,65.891205],[-22.355246,65.905135]],[[-16.641279,66.058022],[-16.624875,66.029353],[-16.623753,66.004867],[-16.659001,65.961373],[-16.65829,65.946282],[-16.626097,65.930461],[-16.552243,65.915953],[-16.523431,65.849837],[-16.532254,65.814941],[-16.602008,65.755101],[-16.604671,65.656314]],[[-16.431877,66.057196],[-16.452333,66.030339],[-16.52518,66.023184],[-16.760715,66.094566],[-16.837855,66.104086],[-16.909022,66.08856],[-16.944611,66.063949],[-16.972007,66.08637],[-17.009309,66.170687],[-17.036562,66.196512],[-17.071191,66.205384],[-17.10874,66.202185],[-17.219387,66.15351],[-17.242872,66.103876],[-17.321674,66.073425],[-17.3438,66.041163],[-17.366073398156555,65.97050930378121]],[[-17.366073398156555,65.97050930378121],[-17.370126,65.957654]],[[-16.165775,65.625207],[-16.165346,65.655404],[-16.177248,65.682891],[-16.292324,65.749355],[-16.351867,65.824747],[-16.414871,66.024584],[-16.432243,66.055102]],[[-16.432243,66.058626],[-16.458012,66.107464],[-16.468034,66.155558],[-16.385261,66.249471],[-16.377066,66.293706],[-16.393704,66.325781],[-16.472873,66.378472],[-16.489009,66.403912],[-16.476448,66.427753],[-16.426512,66.455086],[-16.318648,66.466354],[-16.226928,66.462848],[-16.169461,66.482364],[-15.996117,66.501083],[-15.96202,66.47333],[-15.968298,66.384877],[-15.937557,66.382384],[-15.862705,66.351128],[-15.830733,66.296136],[-15.814414721357602,66.22749310743363]],[[-15.814414721357602,66.22749310743363],[-15.814249,66.226796]],[[-15.505703,65.455876],[-15.505343487747458,65.45621087610341]],[[-15.505343487747458,65.45621087610341],[-15.471293,65.487928],[-15.440068,65.535462],[-15.330463,65.588182],[-15.174001,65.595614],[-15.155901,65.602821],[-15.129847,65.635191],[-15.053684,65.633858],[-14.976745,65.678368],[-14.886747401574521,65.71257614718726]],[[-14.886747401574521,65.71257614718726],[-14.880189,65.715069]],[[-14.896534,65.711933],[-14.924011,65.740468],[-14.922204,65.766526],[-14.838974,65.858275],[-14.822387,65.906471],[-14.826818,65.954632],[-14.861076,65.987991],[-14.907193,66.001571],[-15.063332,66.013288],[-15.206683,66.053583],[-15.225708,66.074274],[-15.230891,66.175823],[-15.251754,66.191871],[-15.303728,66.179352],[-15.323196,66.123234],[-15.388969,66.105696],[-15.4905,66.162184],[-15.636463,66.181872],[-15.737863,66.239799],[-15.814881,66.239522]],[[-15.805996,66.230384],[-15.814414721357602,66.22749310743363]],[[-15.814414721357602,66.22749310743363],[-15.897988,66.198795],[-16.044459,66.183074],[-16.108988,66.157311],[-16.228531,66.161455],[-16.449156,66.115945]],[[-14.634432,65.433449],[-14.631175364308682,65.43679971212019]],[[-14.631175364308682,65.43679971212019],[-14.455151,65.617909],[-14.420935,65.678706],[-14.429605,65.708871],[-14.466127,65.728145],[-14.535869,65.73126],[-14.578033,65.760433],[-14.608472,65.765164],[-14.69273,65.737084],[-14.828929,65.713027],[-14.886747401574521,65.71257614718726]],[[-14.886747401574521,65.71257614718726],[-14.891383,65.71254]],[[-14.392911,65.265804],[-14.349827,65.239506],[-14.334673,65.189143]],[[-14.334673,65.189143],[-14.323552,65.083021],[-14.29186134554887,65.03187363878217]],[[-14.29186134554887,65.03187363878217],[-14.286367,65.023006]],[[-14.286367,65.023006],[-14.198703,64.973071],[-13.80528,64.878543],[-13.781565,64.865796],[-13.777758,64.854176],[-13.81219,64.835529],[-13.843895,64.832598],[-13.945143,64.860301],[-13.952307,64.84974],[-13.947348,64.832251],[-13.896371,64.806062],[-13.928797,64.791043],[-14.105415714194914,64.80245505850438]],[[-14.105415714194914,64.80245505850438],[-14.110228,64.802766]],[[-20.240251,65.656314],[-20.240128670712195,65.66152600848581]],[[-20.240128670712195,65.66152600848581],[-20.239311,65.696364],[-20.216612432876364,65.72617005844354]],[[-20.216612432876364,65.72617005844354],[-20.216515,65.726298],[-20.263434,65.762215],[-20.285194,65.833086]],[[-20.285194,65.833086],[-20.331126,65.916058],[-20.343806,65.983473],[-20.340626,66.037689],[-20.301694,66.069187],[-20.192248,66.090427],[-20.103743,66.072183],[-20.03647,66.033924],[-20.006229,65.996467],[-19.971683,65.91581],[-19.88204,65.82575]],[[-19.88204,65.82575],[-19.879607159518606,65.82329955663089]],[[-19.879607159518606,65.82329955663089],[-19.829936,65.773269],[-19.7854,65.752027],[-19.68942112767341,65.74727505442193]],[[-19.68942112767341,65.74727505442193],[-19.649186,65.745283],[-19.536227,65.712846],[-19.418613,65.721815],[-19.346923,65.74615],[-19.322148,65.783711],[-19.329289,65.806993],[-19.409373,65.913095],[-19.42059,65.951001],[-19.399277,66.009948],[-19.343925,66.053562],[-19.270978,66.068718],[-19.059734,66.049391],[-19.05168668609848,66.0418170798623]],[[-19.05168668609848,66.0418170798623],[-19.017389,66.009537],[-18.926898,65.948297],[-18.869194,65.934133],[-18.833677,65.947775],[-18.782414,66.016581],[-18.731666,66.020518],[-18.666446,66.069251],[-18.583459,66.085821],[-18.542902,66.072057],[-18.530646,66.058771],[-18.524719,65.975569],[-18.509975,65.949817],[-18.370627,65.936493],[-18.332373,65.927498],[-18.277248,65.895904],[-18.228318,65.811348],[-18.2439,65.767378]],[[-19.502471,65.587097],[-19.462489163160583,65.56100894400166]],[[-19.462489163160583,65.56100894400166],[-19.452785,65.554677],[-19.419796,65.496739],[-19.398438,65.479843],[-19.276484,65.437349],[-19.105356,65.341368],[-19.025834,65.325775],[-18.983595,65.283123],[-18.925254,65.256969]],[[-18.090909,65.62183],[-18.09117323956015,65.62134750443232]],[[-18.09117323956015,65.62134750443232],[-18.111619,65.584014],[-18.202478,65.49174],[-18.243733,65.43377],[-18.282496,65.339953],[-18.275218,65.27575]],[[-17.565404,65.690869],[-17.551963,65.652035],[-17.503198,65.583151],[-17.483173,65.527803],[-17.446441,65.473817],[-17.404332,65.439577],[-17.389155,65.376386]],[[-19.83334,65.546508],[-19.847449235761754,65.54064137390364]],[[-19.847449235761754,65.54064137390364],[-19.878073,65.527908],[-19.890206,65.510431],[-19.825888,65.460353],[-19.818827,65.367216],[-19.794553,65.326682],[-19.748502,65.293758],[-19.766744,65.248755],[-19.757307,65.192212],[-19.719911,65.160591],[-19.615072,65.124324],[-19.599677,65.053833],[-19.549438,64.961078],[-19.516815,64.924041],[-19.483328,64.909241]],[[-20.981998,64.469313],[-20.99792,64.414116],[-20.965019,64.352302],[-21.08261,64.324782],[-21.104067,64.303479],[-21.091544218203754,64.27960867809026]],[[-21.091544218203754,64.27960867809026],[-21.090396,64.27742]],[[-20.319736,64.146094],[-20.295422,64.189317],[-20.230337,64.256618],[-20.243162928906287,64.31636328555906]],[[-20.243162928906287,64.31636328555906],[-20.243706,64.318893]],[[-21.042014,64.197933],[-21.035895721757008,64.19801836735375]],[[-21.035895721757008,64.19801836735375],[-20.784002,64.201533],[-20.708911,64.238392],[-20.615602,64.231257],[-20.527447764441842,64.24926210431613]],[[-20.527447764441842,64.24926210431613],[-20.375959,64.280203],[-20.298933,64.312267],[-20.243162928906287,64.31636328555906]],[[-20.243162928906287,64.31636328555906],[-20.189579,64.320299],[-20.131084,64.337181]],[[-21.660615,64.688666],[-21.548109,64.689436],[-21.442952,64.705956],[-21.41146,64.693808],[-21.383075,64.663827],[-21.287656,64.660301],[-21.26493,64.666904],[-21.226638,64.704868],[-21.039077,64.713656],[-20.934181,64.694377],[-20.796299,64.710851],[-20.736598,64.701374],[-20.716819,64.677541],[-20.750183,64.639752],[-20.876999,64.569403],[-20.899566,64.54051],[-20.921388,64.48403],[-20.945574,64.471322],[-21.144146,64.484153],[-21.287175,64.477751],[-21.548691,64.546775],[-21.715168743370246,64.55357923878462]],[[-21.715168743370246,64.55357923878462],[-21.722821,64.553892]],[[-23.364362,64.837268],[-23.426801,64.83179],[-23.552915,64.853001]],[[-23.552915,64.853001],[-23.637722,64.825779],[-23.648998,64.791428],[-23.670474,64.774818],[-23.716474,64.766245],[-23.765318,64.769763],[-23.914156,64.837807],[-23.917823,64.852207],[-23.893688,64.865639],[-23.912249,64.894106],[-23.91026,64.905508]],[[-23.91026,64.905508],[-23.829599,64.910545],[-23.683162,64.882763],[-23.634606,64.885108],[-23.450702,64.927357],[-23.294813,64.916982],[-23.235952,64.922054],[-23.109116,64.969306],[-22.971995,64.969104],[-22.888378,64.979007],[-22.767063297096225,65.01197236592387]],[[-22.767063297096225,65.01197236592387],[-22.748852,65.016921]],[[-13.2,65.19120525430478],[-13.4653,65.251159],[-13.546369,65.25288]],[[-13.433999,65.261181],[-13.2,65.19683306207779]],[[-23.673964,66.047254],[-23.671335,66.027093],[-23.620492,65.978879],[-23.623998,65.967483],[-23.656432,65.947322],[-23.518805,65.907874],[-23.456340300539534,65.89915820738547]],[[-23.456340300539534,65.89915820738547],[-23.443417,65.897355]],[[-22.601,66.11563],[-22.577331,66.112123],[-22.556293,66.095468],[-22.489671,66.083195],[-22.41516,66.097221],[-22.361687,66.086702],[-22.440581,66.05865],[-22.45636,66.030599],[-22.394998,65.992905],[-22.357304,65.956088],[-22.354674,65.930666],[-22.296818,65.892972],[-22.337142,65.882453]],[[-18.56511,65.960471],[-18.587025,65.938555],[-18.595791,65.914011],[-18.666796,65.87544],[-18.845624,65.855278]],[[-21.532418,66.05865],[-21.572742,66.054267],[-21.581508,66.039365],[-21.549074,66.013944],[-21.414953,66.01482],[-21.356221,65.998165],[-21.619202,65.962224],[-21.630598,65.956964],[-21.639364,65.935049],[-21.509626,65.944692],[-21.478069,65.942938],[-21.457907,65.922777],[-21.330799,65.930666],[-21.298365,65.917517],[-21.310637,65.904368],[-21.300118,65.892095],[-21.351838,65.873687],[-21.306254,65.854401],[-21.353591,65.800928],[-21.383395,65.789533],[-21.535925,65.773754]],[[-21.535925,65.773754],[-21.578878,65.775507],[-21.635858,65.761481]],[[-21.635858,65.761481],[-21.709492,65.780767],[-21.78751,65.769371],[-21.793382087857257,65.76304701489364]],[[-21.793382087857257,65.76304701489364],[-21.798906,65.757098],[-21.732136131213256,65.74192306916466]],[[-21.732136131213256,65.74192306916466],[-21.721765,65.739566],[-21.683194,65.707132]],[[-21.635858,65.761481],[-21.617449,65.72817],[-21.598164,65.722911],[-21.581508,65.701872],[-21.467549,65.690476],[-21.420213,65.704502],[-21.379889,65.732553],[-21.41846,65.749209],[-21.465796,65.745702],[-21.493848,65.754468],[-21.492971,65.767617],[-21.535925,65.773754]],[[-23.993925,65.772877],[-23.899252,65.753592],[-23.840519,65.727294],[-23.712535,65.709762],[-23.615232,65.680834]],[[-24.425215,65.520415],[-24.353333,65.53707],[-24.277069,65.532687],[-24.250771,65.544083],[-24.2122,65.543207],[-24.099995,65.565998],[-24.039509,65.545836],[-23.970257,65.536194],[-23.906265,65.506389],[-23.869447,65.502883],[-23.751982,65.524798]],[[-15.921269,65.436261],[-15.91075,65.427495],[-15.917763,65.402073],[-15.908997,65.386294],[-15.828349,65.338081],[-15.773999,65.342464],[-15.689845,65.332821],[-15.66793,65.317919],[-15.622347,65.3074],[-15.475077,65.289868]],[[-15.475077,65.289868],[-15.441766,65.289868],[-15.379527,65.309153],[-15.328344699980834,65.30267800782696]],[[-15.328344699980834,65.30267800782696],[-15.272921099995486,65.29566645547443]],[[-15.272921099995486,65.29566645547443],[-15.234011,65.290744],[-15.170895,65.303017]],[[-21.869911,65.377528],[-21.974227,65.378405],[-22.159191,65.317042],[-22.334512,65.282855],[-22.36344,65.25042],[-22.491424,65.210973],[-22.499314,65.198701],[-22.282792,65.132955],[-22.097829,65.119806],[-21.92952,65.148734],[-21.863775,65.170649],[-21.854132,65.196071],[-21.83923,65.203084],[-21.757706,65.223246]],[[-14.428411,65.285485],[-14.430295792519203,65.28422844510898]],[[-14.430295792519203,65.28422844510898],[-14.452079,65.269706],[-14.5862,65.232888],[-14.637043,65.189935],[-14.77467,65.138215],[-14.95788,65.030393],[-14.91668,65.01812],[-14.887752,65.050555],[-14.759767,65.084742],[-14.561655,65.175909],[-14.513329261732554,65.17277100223964]],[[-14.513329261732554,65.17277100223964],[-14.494156,65.171526]],[[-20.108812,64.351024],[-20.138616,64.319466]],[[-15.204206,64.269499],[-15.208589,64.277389],[-15.186674,64.294044]],[[-18.979744,64.25898],[-19.033217,64.216903],[-19.03497,64.199371],[-19.143669,64.16606]],[[-19.143669,64.16606],[-19.27779,64.16343],[-19.705573,64.12223]],[[-20.144752,63.676914],[-20.214004,63.710225]],[[-18.399432,63.675161],[-18.430113,63.657629],[-18.4231,63.650616],[-18.424326181304306,63.643871303350394]],[[-18.424326181304306,63.643871303350394],[-18.426606,63.631331],[-18.281967,63.578735],[-18.236383,63.5463],[-18.18028,63.570845],[-18.163625,63.588377],[-18.039147,63.599773],[-18.003206,63.615552],[-17.998823,63.630454],[-18.011096,63.654123],[-17.993564,63.728634],[-17.959376,63.7374],[-17.951486,63.747919],[-17.985674,63.777724],[-18.036517,63.782984]]]}
+};
+
+const map = L.map('map',{zoomControl:true, minZoom:5, maxZoom:13,
+  attributionControl:true}).setView([64.6,-21.4],7);
+map.attributionControl.setPrefix('').addAttribution(
+  'Mapa base vectorial &middot; Natural Earth (dominio p&uacute;blico)');
+
+/* Mapa base dibujado en el propio archivo: no depende de tiles externos. */
+const landStyle = () => ({color:cssv('--coast'), weight:1, fillColor:cssv('--land'), fillOpacity:1, interactive:false});
+const glacStyle = () => ({color:cssv('--glacline'), weight:.6, fillColor:cssv('--glac'), fillOpacity:.95, interactive:false});
+const roadStyle = () => ({color:cssv('--road'), weight:1.1, opacity:.9, interactive:false});
+const baseLand = L.geoJSON(GEO.coast, {style:landStyle()}).addTo(map);
+const baseGlac = L.geoJSON(GEO.glaciers, {style:glacStyle()}).addTo(map);
+const baseRoad = L.geoJSON(GEO.roads, {style:roadStyle()}).addTo(map);
+baseLand.bringToBack();
+
+/* Referencia de orientaci\u00f3n: la ciudad que el itinerario esquiva a prop\u00f3sito. */
+L.marker([64.1466,-21.9426],{interactive:false, icon:L.divIcon({className:'',
+  html:'<div class="ref">Reikiavik</div>', iconSize:[80,14], iconAnchor:[6,7]})}).addTo(map);
+
+L.control.layers(null,{'Glaciares':baseGlac,'Rutas':baseRoad},{position:'bottomright'}).addTo(map);
+
+const lStops = L.layerGroup().addTo(map),
+      lLines = L.layerGroup().addTo(map),
+      lBases = L.layerGroup().addTo(map);
+const mIdx = {};
+
+BASES.forEach(b=>{
+  L.marker([b.lat,b.lng],{zIndexOffset:700, icon:L.divIcon({className:'',
+    html:`<div class="mk mk-base" style="width:26px;height:26px">${b.tag}</div>`,
+    iconSize:[26,26], iconAnchor:[13,13]})})
+   .on('click', () => openSheet(null, b.name))
+   .addTo(lBases);
+});
+
+let SEL='all', SUG=false, ROUTE=true;
+const THR=10, SCALE=12, BARH=115;
+
+/* ---------- ruteo real ----------
+   Las líneas siguen las calles consultando OSRM (router.project-osrm.org) desde
+   el navegador. Si el pedido falla —sin red, o bloqueado por el visor— cae de
+   vuelta a las líneas rectas punteadas y a mis distancias estimadas, y lo avisa
+   en el panel. Nunca dibuja una traza inventada. */
+const RT = {};                 // cache: "día|sug" -> {ok, geom, legs}
+let RTSTATE = 'pending';       // pending | ok | partial | fail
+
+function rtKey(d, sug){ return d.n + '|' + (sug ? 1 : 0); }
+
+async function fetchRoute(d, sug){
+  const k = rtKey(d, sug);
+  if(RT[k]) return RT[k];
+  const seq = seqOf(d, sug);
+  const co = seq.map(s => s.lng.toFixed(5)+','+s.lat.toFixed(5)).join(';');
+  const url = 'https://router.project-osrm.org/route/v1/driving/'+co+
+              '?overview=full&geometries=geojson';
+  try{
+    const res = await fetch(url, {mode:'cors'});
+    const j = await res.json();
+    if(j.code !== 'Ok' || !j.routes || !j.routes.length) throw new Error(j.code||'sin ruta');
+    const r = j.routes[0];
+    if(r.legs.length !== seq.length-1) throw new Error('tramos desalineados');
+    RT[k] = {ok:true,
+      geom: r.geometry.coordinates.map(c => [c[1], c[0]]),
+      legs: r.legs.map(l => ({km:l.distance/1000, h:l.duration/3600}))};
+  }catch(e){ RT[k] = {ok:false, err:String(e.message||e)}; }
+  return RT[k];
+}
+
+async function loadRoutes(sug){
+  const res = await Promise.all(DAYS.map(d => fetchRoute(d, sug)));
+  const ok = res.filter(r => r.ok).length;
+  RTSTATE = ok === res.length ? 'ok' : (ok ? 'partial' : 'fail');
+  buildLoad(); renderDay(); draw(); setRtBadge();
+}
+
+function setRtBadge(){
+  const el = document.getElementById('rtb');
+  if(!el) return;
+  const m = {
+    pending:['calculando rutas reales…','var(--dimmer)'],
+    ok:     ['tramos ruteados sobre calles reales · OSRM','var(--ok)'],
+    partial:['algunos tramos ruteados; el resto, estimado','var(--signal)'],
+    fail:   ['sin acceso al ruteador: líneas rectas y km estimados','var(--signal)']
+  }[RTSTATE];
+  el.textContent = m[0]; el.style.color = m[1];
+}
+
+/* recorrido efectivo del día: route con extras insertados si SUG está activo */
+function seqOf(d, sug){
+  if(sug===undefined) sug = SUG;
+  const out=[];
+  d.route.forEach((s,i)=>{
+    out.push(s.base!==undefined ? {...BASES[s.base], isBase:true} : s);
+    if(sug) d.extras.filter(x=>x.after===i).forEach(x=> out.push({...x, sug:true}));
+  });
+  return out;
+}
+
+function draw(){
+  lStops.clearLayers(); lLines.clearLayers();
+  const days = SEL==='all' ? DAYS : [DAYS[SEL]];
+  const pts = [];
+  days.forEach(d=>{
+    const c = clr(d.n-1), seq = seqOf(d);
+    const r = RT[rtKey(d, SUG)];
+    if(ROUTE && seq.length>1){
+      if(r && r.ok){
+        L.polyline(r.geom, {color:'#0d1014', weight:5.5, opacity:.55}).addTo(lLines);
+        L.polyline(r.geom, {color:c, weight:2.8, opacity:.95}).addTo(lLines);
+      }else{
+        L.polyline(seq.map(s=>[s.lat,s.lng]),
+          {color:c, weight:2.2, opacity:.6, dashArray:'6,7'}).addTo(lLines);
+      }
+    }
+    let k=0;
+    seq.forEach(s=>{
+      if(s.isBase) return;
+      k++;
+      const id = d.n+'|'+s.name;
+      const m = L.marker([s.lat,s.lng],{icon:L.divIcon({className:'', iconSize:[23,23],
+        iconAnchor:[11.5,11.5], html:`<div class="mk" style="width:23px;height:23px;background:${c};
+          ${s.sug?'opacity:.62;border:1.5px dashed #12151a':''}">${k}</div>`})})
+        .on('click', () => openSheet(d.n, s.name)).addTo(lStops);
+      mIdx[id]=m; pts.push([s.lat,s.lng]);
+    });
+  });
+  BASES.forEach(b=>pts.push([b.lat,b.lng]));
+  if(pts.length) map.flyToBounds(L.latLngBounds(pts).pad(.16),{duration:.6});
+}
+
+function buildLoad(){
+  const el=document.getElementById('load'); el.innerHTML='';
+  DAYS.forEach(d=>{
+    const c=calc(d,SUG), col=clr(d.n-1);
+    const b=document.createElement('button');
+    b.className='lcol'; b.setAttribute('aria-pressed', String(SEL===d.n-1));
+    b.title=`Día ${d.n} · ${hm(c.drv)} manejo + ${hm(c.act)} actividad`;
+    b.innerHTML=`<div class="bars" style="height:${Math.min(c.tot/SCALE*100,100)}%">
+        <div class="b-act" style="flex:${c.act};background:${col}"></div>
+        <div class="b-drv" style="flex:${c.drv}"></div>
+      </div><span class="lbl">${d.n}</span>`;
+    b.onclick=()=>select(d.n-1);
+    el.appendChild(b);
+  });
+  const t=document.createElement('div');
+  t.className='thr'; t.style.bottom=(19+(THR/SCALE)*BARH)+'px';
+  t.innerHTML='<b>10 h</b>'; el.appendChild(t);
+}
+
+function buildTabs(){
+  const el=document.getElementById('tabs'); el.innerHTML='';
+  const mk=(lbl,val,sub)=>{ const b=document.createElement('button');
+    b.className='tab'; b.setAttribute('aria-pressed',String(SEL===val));
+    b.innerHTML = lbl + (sub?`<span class="tdate">${sub}</span>`:'');
+    if(val!=='all' && SEL===val) b.style.color=clr(val);
+    b.onclick=()=>select(val); return b; };
+  el.appendChild(mk('TODO','all','9 días'));
+  DAYS.forEach(d=> el.appendChild(mk(String(d.n), d.n-1, d.dow+' '+d.date.replace(' sep',''))));
+  // en teléfono, dejar visible la pestaña activa
+  const act = el.querySelector('[aria-pressed="true"]');
+  if(act && el.scrollWidth > el.clientWidth)
+    act.scrollIntoView({block:'nearest', inline:'center'});
+}
+
+function renderDay(){
+  const el=document.getElementById('day');
+
+  if(SEL==='all'){
+    const t=DAYS.reduce((a,d)=>{const c=calc(d,SUG);
+      return {km:a.km+c.km, drv:a.drv+c.drv, act:a.act+c.act};},{km:0,drv:0,act:0});
+    el.innerHTML=`<h2 class="dtitle">Los nueve días</h2>
+      <div class="ddate">Dom 20 → Lun 28 sep · 3 bases · 8 noches</div>
+      <div class="stats">
+        <div class="stat"><b>${Math.round(t.km).toLocaleString('es-AR')}</b><span>km</span></div>
+        <div class="stat"><b>${Math.round(t.drv)} h</b><span>al volante</span></div>
+        <div class="stat"><b>${Math.round(t.act)} h</b><span>actividad</span></div>
+      </div>
+      <div class="warn sig"><strong>Reservas pendientes</strong>
+        Láki Tours para el avistaje del viernes, y las tres termas: Secret Lagoon el miércoles,
+        Hvammsvík el jueves y Blue Lagoon el lunes. Las cuatro exigen reserva online y los cupos
+        son limitados. Hvammsvík y Blue Lagoon son las más urgentes.</div>
+      <div class="warn"><strong>Los dos días pesados</strong>
+        El lunes 28 pide 11 h con el vuelo a las 00:20, y el jueves 24 llega justo a 10 h entre
+        Þingvellir, las termas y el traslado a Snæfellsnes. El sábado 26 tiene medio día libre
+        y es el colchón del viaje.</div>
+      <p class="note" style="margin-top:14px">Tocá un día para ver paradas, tramos y notas. Tocá cualquier parada, en la lista o en el mapa, para abrir la ficha con foto y pasar de una a otra con las flechas.</p>`;
+    return;
+  }
+
+  const d=DAYS[SEL], c=calc(d,SUG), col=clr(d.n-1);
+  let h=`<h2 class="dtitle">${d.title}</h2>
+    <div class="ddate"><span class="dot" style="background:${col}"></span>
+      Día ${d.n} · ${d.dow} ${d.date} · luz ${d.sun}</div>
+    <div class="stats">
+      <div class="stat"><b>${Math.round(c.km)}</b><span>km</span></div>
+      <div class="stat"><b style="color:${c.drv>4?'var(--signal)':'inherit'}">${hm(c.drv)}</b><span>manejo</span></div>
+      <div class="stat"><b style="color:${c.tot>THR?'var(--alert)':'inherit'}">${hm(c.tot)}</b><span>día total</span></div>
+    </div>`;
+  d.flags.forEach(f=> h+=`<div class="warn ${f.t==='sig'?'sig':''}"><strong>${f.h}</strong>${f.b}</div>`);
+  h+=`<div class="sect-t" style="margin:17px 0 5px">Recorrido <em>tramos estimados</em></div>`;
+  if(SUG && d.extras.length)
+    h+=`<div class="menu">Las sugeridas son un menú, no un plan: elegí una o dos por día. Sumadas todas, ${d.extras.length===1?'la parada agrega':'las '+d.extras.length+' agregan'} ${hm(d.extras.reduce((a,x)=>a+x.dur+x.addMin/60,0))} al día.</div>`;
+
+  const rr = RT[rtKey(d, SUG)];
+  let k=0, li=0;
+  d.route.forEach((s,i)=>{
+    const lg=d.legs[i];
+    if(lg){
+      const rl = rr && rr.ok ? rr.legs[li] : null;
+      h += rl
+        ? `<div class="leg-row">↓ <b>${rl.km.toFixed(0)} km</b> · ${Math.round(rl.h*60)} min <span class="rt">ruteado</span></div>`
+        : `<div class="leg-row">↓ <b>${lg.km} km</b> · ${lg.min} min <span style="opacity:.6">estimado</span></div>`;
+      li++;
+    }
+    if(s.base!==undefined){
+      const b=BASES[s.base];
+      h+=`<button class="stop" data-bname="${b.name}" data-lat="${b.lat}" data-lng="${b.lng}"><span class="pin base">⌂</span>
+        <span><span class="nm">${b.name}</span><span class="mt">Alojamiento · ${b.meta}</span>${b.tip?`<span class="tp">${b.tip}</span>`:''}</span>${photoTag(b,'ph')}</button>`;
+    }else{
+      k++;
+      h+=`<button class="stop" data-id="${d.n}|${s.name}" data-lat="${s.lat}" data-lng="${s.lng}">
+        <span class="pin" style="background:${col}">${k}</span><span>
+        <span class="nm">${s.name}${s.book?'<span class="tg res">a reservar</span>':''}</span>
+        <span class="mt">${s.type} · ${hm(s.dur)}${s.approx?' · ubicación aprox.':''}</span>
+        <span class="nt">${s.note}</span>
+        ${s.tip?`<span class="tp">${s.tip}</span>`:''}</span>${photoTag(s,'ph')}</button>`;
+    }
+    if(SUG) d.extras.filter(x=>x.after===i).forEach(x=>{
+      k++;
+      if(rr && rr.ok && rr.legs[li]){
+        h+=`<div class="leg-row">↓ <b>${rr.legs[li].km.toFixed(0)} km</b> · ${Math.round(rr.legs[li].h*60)} min <span class="rt">ruteado</span></div>`;
+        li++;
+      }
+      h+=`<button class="stop ex" data-id="${d.n}|${x.name}" data-lat="${x.lat}" data-lng="${x.lng}">
+        <span class="pin sug">${k}</span><span>
+        <span class="nm">${x.name}<span class="tg sug">sugerido</span></span>
+        <span class="mt">${x.type} · ${hm(x.dur)} · desvío +${x.addKm} km / +${x.addMin} min</span>
+        <span class="nt">${x.note}</span>
+        ${x.tip?`<span class="tp">${x.tip}</span>`:''}</span>${photoTag(x,'ph')}</button>`;
+    });
+  });
+
+  el.innerHTML=h;
+  el.querySelectorAll('.stop').forEach(btn=> btn.onclick=()=>{
+    const id = btn.dataset.id;
+    if(id){ const [dn, nm] = id.split('|'); openSheet(+dn, nm); }
+    else { openSheet(null, btn.dataset.bname); }
+  });
+}
+
+let select = function(v){
+  SEL=v; buildTabs(); buildLoad(); renderDay(); draw();
+  if(v!=='all') loadPhotos(DAYS[v]);
+};
+
+document.getElementById('swSug').onchange = e=>{
+  SUG=e.target.checked; buildLoad(); renderDay(); draw();
+  if(RTSTATE!=='fail'){ RTSTATE='pending'; setRtBadge(); loadRoutes(SUG); }
+};
+document.getElementById('swRoute').onchange = e=>{ROUTE=e.target.checked; draw();};
+document.getElementById('swBase').onchange = e=>{ e.target.checked? lBases.addTo(map) : map.removeLayer(lBases); };
+
+document.getElementById('verify').innerHTML=`
+  <div class="sect-t">Datos prácticos</div>
+  <ul>
+    <li><b>Estacionamiento pago</b> en casi todos los sitios grandes: ~1.000 ISK por auto y por día, con la app Parka o escaneando el QR de checkit.is. Kerið cobra por persona. Gullfoss seguía gratis en 2026. Bajate Parka antes de viajar.</li>
+    <li><b>Termas:</b> es norma estricta en todo el país ducharse sin traje de baño en el vestuario antes de entrar. Sacate las alhajas y ponete acondicionador si vas a la Blue Lagoon.</li>
+    <li><b>Horarios islandeses:</b> almuerzo entre 11:30 y 14:00, cena entre 18:00 y 20:00. Los supermercados cierran entre 18:00 y 19:00, también los fines de semana.</li>
+    <li><b>Antes de salir cada día:</b> vedur.is para el clima, umferdin.is para el estado de las rutas, safetravel.is para alertas. Emergencias: 112, y conviene tener la app 112 Iceland instalada.</li>
+    <li><b>Auroras:</b> Hello Aurora o My Aurora Forecast. Con las tres bases lejos de luz urbana alcanza con mirar el pronóstico de nubes y salir al porche.</li>
+    <li><b>Las fotos vienen de Wikipedia y Wikimedia Commons</b>, con licencia libre, y se piden al abrir cada día. No están dentro del archivo: sin conexión no aparecen y el resto funciona igual. Tocá una parada en el mapa para verla grande.</li>
+    <li><b>Los tramos se rutean contra OSRM al abrir el mapa</b>, sobre la red de OpenStreetMap: la línea sigue el camino real y los km y minutos son los del ruteador. Si el pedido falla, vuelve a líneas rectas y a distancias estimadas, y el panel lo avisa.</li>
+    <li><b>Los minutos del ruteador son de manejo puro</b>, con buen tiempo y sin paradas. Sumá margen por viento, ripio y ovejas en la ruta.</li>
+    <li><b>Sin señal funciona igual:</b> el mapa base, las paradas y todas las notas están dentro del archivo. Lo único que necesita internet es el ruteo de las líneas.</li>
+  </ul>`;
+
+/* ---------- fotos ----------
+   Vienen de Wikipedia / Wikimedia Commons, que tienen licencia libre, y se piden
+   desde el navegador al abrir cada día. No van incrustadas en el archivo: sin red
+   simplemente no aparecen, y el resto del mapa funciona igual.
+   Se pide una tanda por día con los títulos exactos; los que no resuelven caen a
+   una búsqueda por nombre. */
+const PH = {};                       // nombre de parada -> {src, page} | null
+const WAPI = 'https://en.wikipedia.org/w/api.php';
+
+function stopsOf(d){
+  // incluye los alojamientos del día: son el arranque y el cierre del recorrido
+  // y también se navegan con las flechas.
+  const bases = d.route.filter(s => s.base!==undefined).map(s => BASES[s.base]);
+  return d.route.filter(s => s.base===undefined).concat(d.extras || [], bases);
+}
+
+async function wq(params){
+  const u = WAPI + '?' + new URLSearchParams(
+    Object.assign({action:'query', format:'json', origin:'*'}, params));
+  const r = await fetch(u);
+  return r.json();
+}
+
+function harvest(j){
+  const q = j.query || {}, pages = q.pages || {};
+  // Wikipedia devuelve el título final; hay que rastrear normalizaciones y
+  // redirecciones para volver al título que pedimos.
+  const back = {};
+  (q.normalized || []).forEach(x => back[x.to] = x.from);
+  (q.redirects  || []).forEach(x => back[x.to] = back[x.from] || x.from);
+  const out = {};
+  Object.values(pages).forEach(p => {
+    if(!p.thumbnail) return;
+    const rec = {src:p.thumbnail.source,
+      page:'https://en.wikipedia.org/wiki/' + encodeURIComponent(p.title.replace(/ /g,'_'))};
+    out[p.title] = rec;
+    let k = p.title, guard = 0;
+    while(back[k] && guard++ < 5){ k = back[k]; out[k] = rec; }
+  });
+  return out;
+}
+
+async function loadPhotos(d){
+  const stops = stopsOf(d).filter(s => PH[s.name] === undefined);
+  if(!stops.length) return;
+  stops.forEach(s => PH[s.name] = null);          // marca "pedido"
+  const titled = stops.filter(s => s.wiki);
+  try{
+    if(titled.length){
+      const j = await wq({prop:'pageimages', piprop:'thumbnail', pithumbsize:'900',
+                          redirects:'1',
+                          titles: [...new Set(titled.map(s=>s.wiki))].join('|')});
+      const got = harvest(j);
+      titled.forEach(s => { if(got[s.wiki]) PH[s.name] = got[s.wiki]; });
+    }
+    // los que quedaron sin foto: búsqueda por nombre, de a uno y sin bloquear
+    const misses = stops.filter(s => !PH[s.name]).slice(0, 8);
+    await Promise.all(misses.map(async s => {
+      try{
+        const j = await wq({generator:'search', gsrsearch:s.name+' Iceland', gsrlimit:'1',
+                            prop:'pageimages', piprop:'thumbnail', pithumbsize:'900'});
+        const got = Object.values(harvest(j))[0];
+        if(got) PH[s.name] = got;
+      }catch(e){}
+    }));
+  }catch(e){}
+  renderDay(); draw();
+  if(NAVi >= 0) paintSheet();
+}
+
+function photoTag(s, cls){
+  const p = PH[s.name];
+  if(!p) return '';
+  return `<span class="${cls}"><img src="${p.src}" alt="${s.name}" loading="lazy"
+     onerror="this.parentNode.style.display='none'"></span>`;
+}
+
+/* ---------- panel de parada ----------
+   Reemplaza al globo de Leaflet: hay lugar para la foto grande y para el texto
+   completo. NAV es la lista de paradas recorrible con las flechas: sigue el
+   orden del día abierto, o todos los días encadenados si está en «TODO». */
+let NAV = [], NAVi = -1;
+
+function buildNav(){
+  NAV = [];
+  const days = SEL==='all' ? DAYS : [DAYS[SEL]];
+  days.forEach(d => seqOf(d).forEach(s => {
+    // seqOf ya devuelve el orden real del recorrido, con las sugeridas
+    // intercaladas donde corresponde; los alojamientos se repiten entre días,
+    // así que se agregan una sola vez.
+    if(!s.isBase) NAV.push({d, s});
+    else if(!NAV.some(x => x.base && x.s.name===s.name)) NAV.push({d, s, base:true});
+  }));
+}
+
+const $ = id => document.getElementById(id);
+
+function openSheet(dayN, name){
+  buildNav();
+  const i = NAV.findIndex(x => x.s.name===name && (x.d.n===dayN || x.base));
+  if(i < 0) return;
+  NAVi = i; paintSheet(); $('ov').hidden = false;
+  document.body.style.overflow = 'hidden';
+  $('shX').focus();
+}
+function closeSheet(){
+  $('ov').hidden = true; NAVi = -1;
+  document.body.style.overflow = '';
+}
+function stepSheet(dir){
+  if(NAVi < 0) return;
+  const n = NAVi + dir;
+  if(n < 0 || n >= NAV.length) return;
+  NAVi = n; paintSheet();
+}
+
+function paintSheet(){
+  const {d, s, base} = NAV[NAVi];
+  const col = clr(d.n-1);
+  const p = PH[s.name];
+
+  const img = $('shImg');
+  if(p){
+    img.className = 'on';
+    // En los alojamientos la foto es del paraje, no de la cabaña: hay que decirlo.
+    const cap = base && s.area ? `<span class="cap">${s.area} — foto de la zona, no del alojamiento</span>` : '';
+    img.innerHTML = `<img src="${p.src}" alt="${s.name}"
+      onerror="document.getElementById('shImg').className=''">` + cap;
+  }
+  else { img.className = ''; img.innerHTML = ''; }
+
+  $('shDay').innerHTML = base
+    ? `<span class="dot" style="background:var(--ink)"></span>Alojamiento`
+    : `<span class="dot" style="background:${col}"></span>Día ${d.n} · ${d.dow} ${d.date}`;
+  $('shT').textContent = s.name;
+
+  const bits = [];
+  if(base){ bits.push(s.meta); }
+  else{
+    bits.push(s.type);
+    if(s.dur) bits.push(hm(s.dur));
+    if(s.sug) bits.push('sugerido · desvío +' + s.addKm + ' km / +' + s.addMin + ' min');
+    if(s.book) bits.push('a reservar');
+    if(s.approx) bits.push('ubicación aprox.');
+  }
+  $('shMeta').textContent = bits.join(' · ');
+  $('shNote').textContent = s.note || '';
+  $('shTip').textContent = s.tip || '';
+  $('shCount').textContent = (NAVi+1) + ' / ' + NAV.length +
+    (SEL==='all' ? ' · todo el viaje' : ' · día ' + d.n);
+  // addr tiene prioridad: cuando un alojamiento tenga dirección exacta, Google la
+  // resuelve mejor que una coordenada aproximada.
+  $('shMap').href = 'https://www.google.com/maps/search/?api=1&query=' +
+    encodeURIComponent(s.addr ? s.addr : (s.lat + ',' + s.lng));
+  $('shMap').textContent = base && !s.addr ? 'Buscar la zona en Google Maps' : 'Abrir en Google Maps';
+
+  $('shP').disabled = NAVi === 0;
+  $('shN').disabled = NAVi === NAV.length - 1;
+  $('sheet').scrollTop = 0;
+  map.panTo([s.lat, s.lng], {animate:true, duration:.5});
+}
+
+$('shX').onclick = closeSheet;
+$('shP').onclick = () => stepSheet(-1);
+$('shN').onclick = () => stepSheet(1);
+$('ov').addEventListener('click', e => { if(e.target === $('ov')) closeSheet(); });
+document.addEventListener('keydown', e => {
+  if($('ov').hidden) return;
+  if(e.key === 'Escape') closeSheet();
+  if(e.key === 'ArrowLeft') stepSheet(-1);
+  if(e.key === 'ArrowRight') stepSheet(1);
+});
+// deslizar horizontal en el teléfono
+let tx = 0, ty = 0;
+$('sheet').addEventListener('touchstart', e => {
+  tx = e.changedTouches[0].clientX; ty = e.changedTouches[0].clientY;
+}, {passive:true});
+$('sheet').addEventListener('touchend', e => {
+  const dx = e.changedTouches[0].clientX - tx, dy = e.changedTouches[0].clientY - ty;
+  if(Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy)*1.6) stepSheet(dx < 0 ? 1 : -1);
+}, {passive:true});
+
+/* ---------- temas ----------
+   El cambio toca tres capas: las variables CSS (automático), los colores por día
+   que el JS lee de esas variables, y los estilos de las capas del mapa base, que
+   Leaflet fija al crearlas y hay que reasignar a mano. */
+function applyTheme(t){
+  document.documentElement.setAttribute('data-theme', t);
+  document.querySelectorAll('#themer button').forEach(b =>
+    b.setAttribute('aria-pressed', String(b.dataset.t === t)));
+  requestAnimationFrame(()=>{
+    readDC();
+    if(baseLand.setStyle){
+      baseLand.setStyle(landStyle()); baseGlac.setStyle(glacStyle()); baseRoad.setStyle(roadStyle());
+    }
+    buildTabs(); buildLoad(); renderDay(); draw();
+  });
+}
+document.querySelectorAll('#themer button').forEach(b =>
+  b.onclick = () => applyTheme(b.dataset.t));
+
+/* ---------- ajustes de teléfono ---------- */
+const MQ = window.matchMedia('(max-width:900px)');
+
+// Leaflet necesita recalcular el tamaño cuando cambia el alto del contenedor
+// (barra de direcciones de Android, rotación, cambio de layout).
+/* Si por cualquier motivo el contenedor queda sin alto (iframes que se
+   dimensionan por contenido, unidades de viewport que colapsan), se lo
+   imponemos en píxeles para que el mapa nunca quede invisible. */
+function ensureMapHeight(){
+  const el = document.getElementById('map');
+  const wrap = document.getElementById('mapwrap');
+  if(!el) return;
+  if(el.clientHeight < 120){
+    const px = MQ.matches ? 440 : Math.max(360, Math.round(window.innerHeight || 640));
+    wrap.style.height = px + 'px';
+    el.style.height = px + 'px';
+  }
+  if(map.invalidateSize) map.invalidateSize();
+}
+function resize(){ setTimeout(ensureMapHeight, 120); }
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', resize);
+if(MQ.addEventListener) MQ.addEventListener('change', resize);
+
+// El scroll de una página larga y el paneo del mapa se pelean por el mismo dedo:
+// desactivar el zoom por rueda evita que el mapa se coma el scroll.
+if(MQ.matches && map.scrollWheelZoom) map.scrollWheelZoom.disable();
+
+// Botón flotante para volver al mapa una vez que quedó arriba.
+const toMap = document.getElementById('tomap');
+toMap.onclick = ()=>{
+  document.getElementById('mapwrap').scrollIntoView({behavior:'smooth', block:'start'});
+};
+function onScroll(){
+  if(!MQ.matches) return;
+  const mw = document.getElementById('mapwrap').getBoundingClientRect();
+  toMap.classList.toggle('on', mw.bottom < 60);
+}
+window.addEventListener('scroll', onScroll, {passive:true});
+
+// Al elegir un día en el teléfono, llevar la vista al detalle sin perder el mapa.
+const _select = select;
+select = function(v){
+  _select(v);
+  if(MQ.matches) setTimeout(()=>{ if(map.invalidateSize) map.invalidateSize(); }, 150);
+};
+
+buildTabs(); buildLoad(); renderDay(); draw(); setRtBadge(); onScroll();
+DAYS.forEach((d,i)=> setTimeout(()=>loadPhotos(d), 300 + i*220));  // escalonado, sin saturar
+// El alto se revisa varias veces: al armar, al terminar de cargar y cuando el
+// navegador móvil termina de acomodar su barra de direcciones.
+ensureMapHeight();
+[100, 400, 1200].forEach(ms => setTimeout(ensureMapHeight, ms));
+window.addEventListener('load', ensureMapHeight);
+loadRoutes(false);
+</script>
+</body>
+</html>
