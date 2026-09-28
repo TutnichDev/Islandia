@@ -1,0 +1,834 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Saga del Último Día</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;800&family=Crimson+Pro:ital,wght@0,400;0,600;0,700;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root {
+    --bg: #eadcbd;
+    --bg2: #dcc9a0;
+    --card: #f5ecd6;
+    --ink: #2b1d0e;
+    --muted: #6b5638;
+    --iron: #3a332b;
+    --gold: #a8812f;
+    --blood: #8b2e1f;
+    --sea: #24566a;
+    --moss: #4f6b3a;
+    --stone: #5e6168;
+    --line: #b89d6a;
+    --warn-bg: #f1dcc6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17120d;
+      --bg2: #221a12;
+      --card: #251c14;
+      --ink: #eee0c2;
+      --muted: #b7a17c;
+      --iron: #0e0b08;
+      --gold: #d2a64a;
+      --blood: #d1604a;
+      --sea: #5aa3bd;
+      --moss: #8fb070;
+      --stone: #9aa0a8;
+      --line: #5a4630;
+      --warn-bg: #3a2418;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    color: var(--ink);
+    background:
+      radial-gradient(ellipse at 20% 0%, rgba(255,255,255,.18), transparent 55%),
+      radial-gradient(ellipse at 80% 100%, rgba(0,0,0,.10), transparent 60%),
+      var(--bg);
+    font-family: "Crimson Pro", Georgia, "Times New Roman", serif;
+    font-size: 18px;
+    line-height: 1.5;
+    -webkit-text-size-adjust: 100%;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 0 16px 56px; }
+
+  /* Cabecera */
+  header {
+    text-align: center;
+    padding: 36px 16px 26px;
+    margin: 0 -16px;
+    background:
+      repeating-linear-gradient(90deg, rgba(255,255,255,.03) 0 2px, transparent 2px 9px),
+      linear-gradient(180deg, #3b2a1a, #24190f);
+    color: #f1e2bf;
+    border-bottom: 4px double var(--gold);
+  }
+  .runes { font-size: 1.05rem; letter-spacing: .5em; color: var(--gold); opacity: .9; }
+  header h1 {
+    font-family: "Cinzel", Georgia, serif;
+    font-weight: 800;
+    font-size: clamp(1.7rem, 6vw, 2.5rem);
+    letter-spacing: .06em;
+    margin: 8px 0 4px;
+    text-shadow: 0 2px 0 rgba(0,0,0,.5);
+  }
+  header p { margin: 0; color: #d8c49a; font-style: italic; }
+  .route {
+    display: inline-block;
+    margin-top: 14px;
+    font-family: "Cinzel", Georgia, serif;
+    font-size: .8rem;
+    letter-spacing: .08em;
+    color: #f1e2bf;
+    border: 1px solid rgba(210,166,74,.6);
+    padding: 5px 12px;
+    border-radius: 3px;
+  }
+
+  .note {
+    background: var(--warn-bg);
+    border: 1px solid var(--line);
+    border-left: 5px solid var(--blood);
+    padding: 12px 14px;
+    border-radius: 4px;
+    margin: 22px 0 8px;
+    font-size: 1rem;
+  }
+  .note p { margin: 0 0 6px; }
+  .note p:last-child { margin: 0; }
+  .note a { color: var(--blood); font-weight: 700; }
+
+  h2 {
+    font-family: "Cinzel", Georgia, serif;
+    font-weight: 800;
+    font-size: 1.12rem;
+    letter-spacing: .05em;
+    margin: 36px 0 14px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    text-align: center;
+  }
+  h2::before, h2::after {
+    content: "";
+    flex: 1;
+    min-width: 20px;
+    height: 0;
+    border-top: 3px double var(--line);
+  }
+  h2 .roman { color: var(--blood); }
+  .section-sub { margin: -6px 0 14px; color: var(--muted); font-style: italic; text-align: center; }
+
+  /* Selector de paradas */
+  .picker {
+    background: var(--card);
+    border: 2px solid var(--iron);
+    outline: 1px solid var(--gold);
+    outline-offset: -6px;
+    border-radius: 6px;
+    padding: 16px 16px 12px;
+  }
+  .picker-head {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: 8px; margin-bottom: 10px;
+  }
+  .picker-head strong { font-family: "Cinzel", Georgia, serif; font-size: .95rem; letter-spacing: .05em; }
+  .count { color: var(--muted); font-style: italic; font-size: .95rem; }
+  .picker-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btn {
+    font-family: "Cinzel", Georgia, serif;
+    font-weight: 600;
+    font-size: .72rem;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--ink);
+    background: var(--bg2);
+    border: 1px solid var(--line);
+    padding: 6px 10px;
+    border-radius: 3px;
+    cursor: pointer;
+  }
+  .btn:hover { border-color: var(--gold); }
+  .btn.active { background: var(--blood); border-color: var(--blood); color: #fff3dc; }
+  .pick-group {
+    font-family: "Cinzel", Georgia, serif;
+    font-size: .72rem;
+    font-weight: 800;
+    letter-spacing: .08em;
+    color: var(--muted);
+    text-transform: uppercase;
+    margin: 10px 0 2px;
+    grid-column: 1 / -1;
+  }
+  .pick-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+    gap: 4px 14px;
+  }
+  .pick-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 5px 4px;
+    border-radius: 4px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .pick-item:hover { background: rgba(168,129,47,.12); }
+  .pick-item input { width: 18px; height: 18px; accent-color: var(--blood); cursor: pointer; flex-shrink: 0; }
+  .pick-item .name { font-weight: 600; line-height: 1.2; }
+  .pick-item .extra { display: block; font-weight: 400; font-style: italic; font-size: .85rem; color: var(--muted); }
+  .pick-item.off .name { color: var(--muted); text-decoration: line-through; text-decoration-color: var(--line); }
+  .pick-item.off .extra { text-decoration: none; }
+
+  /* Escudos (pines y números) */
+  .shield {
+    --c: #24566a;
+    width: 30px; height: 30px;
+    border-radius: 50%;
+    background: conic-gradient(var(--c) 0 25%, color-mix(in srgb, var(--c) 68%, #000) 0 50%, var(--c) 0 75%, color-mix(in srgb, var(--c) 68%, #000) 0);
+    border: 3px solid #2a2118;
+    box-shadow: 0 0 0 1.5px #c9a55a, 0 2px 5px rgba(0,0,0,.45);
+    color: #fff5dc;
+    font-family: "Cinzel", Georgia, serif;
+    font-weight: 800;
+    font-size: 13px;
+    display: inline-flex; align-items: center; justify-content: center;
+    text-shadow: 0 1px 2px rgba(0,0,0,.8);
+    flex-shrink: 0;
+  }
+  .shield.sm { width: 24px; height: 24px; font-size: 11px; border-width: 2px; }
+  .shield.road { --c: #4f6b3a; }
+  .shield.city { --c: #24566a; }
+  .shield.rey  { --c: #8b2e1f; }
+  .shield.end  { --c: #4a4d53; }
+
+  /* Mapa */
+  .map-box {
+    margin-top: 16px;
+    background: var(--card);
+    border: 2px solid var(--iron);
+    outline: 1px solid var(--gold);
+    outline-offset: -6px;
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .map-bar { display: flex; gap: 8px; flex-wrap: wrap; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  #map { height: 470px; width: 100%; background: #cdbf9f; }
+  @media (max-width: 480px) { #map { height: 400px; } }
+  #map .leaflet-tile-pane { filter: sepia(.5) saturate(.75) contrast(.95) brightness(.97); }
+  .legend {
+    display: flex; gap: 8px 14px; flex-wrap: wrap;
+    padding: 10px 14px;
+    font-size: .92rem;
+    color: var(--muted);
+    border-top: 1px solid var(--line);
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .line { width: 24px; height: 5px; border-radius: 2px; display: inline-block; background: #8b2e1f; box-shadow: 0 0 0 1px #f5ecd6; }
+  .line.fallback { background: repeating-linear-gradient(90deg, #8b2e1f 0 5px, transparent 5px 9px); box-shadow: none; }
+
+  .pin { background: transparent; border: none; }
+  .leaflet-tooltip.tag {
+    font-family: "Cinzel", Georgia, serif;
+    font-weight: 600;
+    font-size: 11.5px;
+    letter-spacing: .03em;
+    padding: 2px 8px;
+    border-radius: 2px;
+    border: 1px solid #2a2118;
+    box-shadow: 0 1px 3px rgba(0,0,0,.35);
+    color: #2b1d0e;
+    background: #f5ecd6;
+    white-space: nowrap;
+  }
+  .leaflet-tooltip.tag.road { border-left: 4px solid #4f6b3a; }
+  .leaflet-tooltip.tag.city { border-left: 4px solid #24566a; }
+  .leaflet-tooltip.tag.rey  { border-left: 4px solid #8b2e1f; }
+  .leaflet-tooltip.tag.end  { border-left: 4px solid #4a4d53; }
+  .leaflet-tooltip.tag.group { background: #24566a; color: #fff5dc; border-color: #2a2118; }
+  .leaflet-tooltip.tag::before { display: none; }
+
+  /* Paradas */
+  .stop {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-left: 5px solid var(--sea);
+    border-radius: 4px;
+    padding: 16px 16px 14px;
+    margin-bottom: 14px;
+    box-shadow: 0 2px 0 rgba(0,0,0,.06);
+    transition: opacity .2s;
+  }
+  .stop.road { border-left-color: var(--moss); }
+  .stop.rey { border-left-color: var(--blood); }
+  .stop.end { border-left-color: var(--stone); }
+  .stop.off { opacity: .45; }
+  .stop-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+  .stop h3 {
+    font-family: "Cinzel", Georgia, serif;
+    font-weight: 800;
+    font-size: 1.08rem;
+    letter-spacing: .02em;
+    margin: 0;
+    flex: 1 1 auto;
+  }
+  .time {
+    font-family: "Cinzel", Georgia, serif;
+    font-weight: 600;
+    font-size: .8rem;
+    color: var(--gold);
+    border: 1px solid var(--gold);
+    padding: 1px 7px;
+    border-radius: 2px;
+    white-space: nowrap;
+  }
+  .time.plus { color: var(--moss); border-color: var(--moss); }
+  .card-pick {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: .9rem; color: var(--muted); cursor: pointer; user-select: none;
+    margin-left: auto;
+  }
+  .card-pick input { width: 17px; height: 17px; accent-color: var(--blood); cursor: pointer; }
+  .stop p { margin: 6px 0; }
+  .label {
+    font-family: "Cinzel", Georgia, serif;
+    font-weight: 800;
+    font-size: .82rem;
+    letter-spacing: .04em;
+    color: var(--blood);
+  }
+  .tag-warn {
+    display: inline-block;
+    background: var(--warn-bg);
+    color: var(--blood);
+    border: 1px solid var(--blood);
+    font-family: "Cinzel", Georgia, serif;
+    font-size: .72rem;
+    font-weight: 800;
+    letter-spacing: .05em;
+    padding: 2px 8px;
+    border-radius: 2px;
+    margin-top: 4px;
+  }
+  .links { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 10px; }
+  .links a, .links button {
+    color: var(--sea);
+    font-weight: 700;
+    text-decoration: none;
+    font-size: 1rem;
+    background: none; border: none; padding: 0; cursor: pointer;
+    font-family: inherit;
+  }
+  .links a:hover, .links button:hover { text-decoration: underline; }
+
+  footer {
+    margin-top: 40px;
+    text-align: center;
+    color: var(--muted);
+    font-size: .9rem;
+    font-style: italic;
+  }
+  footer .runes { display: block; margin-bottom: 6px; font-style: normal; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+<header>
+  <div class="runes">ᚱ ᛖ ᚤ ᚴ ᛃ ᚨ ᚢ ᛁ ᚴ</div>
+  <h1>Saga del Último Día</h1>
+  <p>Lunes 28 de septiembre · el drakkar de hierro parte a las 23:00 desde Keflavík</p>
+  <div class="route">Snæfellsnes ᛫ Reykjavík ᛫ Reykjanes ᛫ Keflavík</div>
+</header>
+
+<div class="note">
+  <p><strong>Antes de zarpar:</strong> sin paradas en el camino, salir de Arnarstapi tipo 9:45 (≈2h15 hasta Reykjavík) para llegar a las 12:00. Cada parada del camino (A–D) suma tiempo: con todas, calculen salir cerca de 1h45 antes o recortar algo de la tarde.</p>
+  <p>Viking World cierra a las 16:00: si el día se atrasa, es lo primero que se saca. Revisar <a href="https://umferdin.is" target="_blank" rel="noopener">umferdin.is</a> por posibles cortes de ruta cerca de Grindavík; si el tramo entre Gunnuhver y Seltún está cortado, volver directo por Reykjanesbær.</p>
+</div>
+
+<h2><span class="roman">ᛟ</span>&nbsp;Elegí tu recorrido</h2>
+
+<div class="picker">
+  <div class="picker-head">
+    <div><strong>Paradas</strong> <span class="count" id="count"></span></div>
+    <div class="picker-actions">
+      <button class="btn" id="preset-base">Plan base</button>
+      <button class="btn" id="all-on">Todas</button>
+      <button class="btn" id="all-off">Ninguna</button>
+    </div>
+  </div>
+  <div class="pick-list" id="pick-list"></div>
+</div>
+
+<div class="map-box" id="mapa">
+  <div class="map-bar">
+    <button class="btn active" data-view="all">Todo el día</button>
+    <button class="btn" data-view="road">Camino</button>
+    <button class="btn" data-view="city">Reykjavík</button>
+    <button class="btn" data-view="rey">Reykjanes</button>
+  </div>
+  <div id="map"></div>
+  <div class="legend">
+    <span><i class="shield sm road"></i>Camino (opcional)</span>
+    <span><i class="shield sm city"></i>Reykjavík</span>
+    <span><i class="shield sm rey"></i>Reykjanes</span>
+    <span><i class="shield sm end"></i>Salida / aeropuerto</span>
+    <span id="route-legend"><i class="line"></i>Trazando la ruta…</span>
+  </div>
+</div>
+
+<!-- ============ CAMINO ============ -->
+<h2><span class="roman">I</span>&nbsp;El camino desde Snæfellsnes</h2>
+<p class="section-sub">Paradas opcionales sobre la ruta a Reykjavík. Vienen destildadas: sumalas si les da el tiempo.</p>
+
+<div class="stop road" data-stop="1">
+  <div class="stop-head"><span class="shield road">A</span><span class="time plus">+20 min</span><h3>Búðakirkja, la iglesia negra</h3>
+    <label class="card-pick"><input type="checkbox" class="pick" data-stop="1">Incluir</label></div>
+  <p><span class="label">QUÉ ES ·</span> una pequeña iglesia de madera pintada de negro, sola en medio de un campo de lava frente al mar, en la antigua aldea de Búðir. La construcción actual es de 1848.</p>
+  <p><span class="label">POR QUÉ IR ·</span> es una de las imágenes más fotografiadas de Snæfellsnes: la iglesia negra con el glaciar Snæfellsjökull de fondo. Queda a 15 minutos de Arnarstapi, casi sin desvío, y se ve desde el estacionamiento sin caminar.</p>
+  <div class="links">
+    <button data-focus="1">🗺️ Ver en el mapa</button>
+    <a href="https://www.google.com/maps/search/?api=1&query=B%C3%BA%C3%B0akirkja&query_place_id=ChIJv8Ug4gN_1UgRtUn7cmhYLgc" target="_blank" rel="noopener">📍 Google Maps</a>
+  </div>
+</div>
+
+<div class="stop road" data-stop="2">
+  <div class="stop-head"><span class="shield road">B</span><span class="time plus">+25 min</span><h3>Ytri Tunga, playa de focas</h3>
+    <label class="card-pick"><input type="checkbox" class="pick" data-stop="2">Incluir</label></div>
+  <p><span class="label">QUÉ ES ·</span> una playa de arena dorada (rara en Islandia, donde casi todas son negras) con rocas donde descansa una colonia de focas grises y comunes.</p>
+  <p><span class="label">POR QUÉ IR ·</span> es el lugar más conocido de la península para ver focas en libertad, y queda al costado de la ruta. Ojo: para acercarse a las focas hay que caminar sobre rocas resbaladizas; desde la playa a veces se ven de lejos, así que el adulto de 70 puede disfrutarlo sin meterse en las rocas.</p>
+  <div class="links">
+    <button data-focus="2">🗺️ Ver en el mapa</button>
+    <a href="https://www.google.com/maps/search/?api=1&query=Ytri+Tunga&query_place_id=ChIJzSUd_8eC1UgRutzvVz9H3aQ" target="_blank" rel="noopener">📍 Google Maps</a>
+  </div>
+</div>
+
+<div class="stop road" data-stop="3">
+  <div class="stop-head"><span class="shield road">C</span><span class="time plus">+20 min</span><h3>Gerðuberg, muralla de basalto</h3>
+    <label class="card-pick"><input type="checkbox" class="pick" data-stop="3">Incluir</label></div>
+  <p><span class="label">QUÉ ES ·</span> una pared natural de casi medio kilómetro de columnas de basalto hexagonales, de 7 a 14 metros de alto, formadas por lava que se enfrió lentamente.</p>
+  <p><span class="label">POR QUÉ IR ·</span> parece una muralla de fortaleza hecha a mano. Es la misma formación que inspiró la fachada de Hallgrímskirkja, así que después la reconocen en la iglesia. Se ve bien desde el estacionamiento, al que se llega por un camino de ripio corto apto para auto común.</p>
+  <div class="links">
+    <button data-focus="3">🗺️ Ver en el mapa</button>
+    <a href="https://www.google.com/maps/search/?api=1&query=Ger%C3%B0uberg+Cliffs&query_place_id=ChIJ-yebcYam1UgRRkgAgGbzvsk" target="_blank" rel="noopener">📍 Google Maps</a>
+  </div>
+</div>
+
+<div class="stop road" data-stop="4">
+  <div class="stop-head"><span class="shield road">D</span><span class="time plus">+30–60 min</span><h3>Settlement Center, Borgarnes</h3>
+    <label class="card-pick"><input type="checkbox" class="pick" data-stop="4">Incluir</label></div>
+  <p><span class="label">QUÉ ES ·</span> un museo sobre cómo llegaron los vikingos a Islandia y sobre la Saga de Egil, un poeta guerrero de esta zona, con audioguía. Tiene un restaurante con buffet muy bien recomendado.</p>
+  <p><span class="label">POR QUÉ IR ·</span> es la parada más vikinga de todo el día y un lugar cómodo para cortar el manejo: baños, café y comida en un edificio histórico junto al fiordo. Si paran a comer acá, pueden saltear el puesto de panchos en Reykjavík. Abre de 10 a 21.</p>
+  <div class="links">
+    <button data-focus="4">🗺️ Ver en el mapa</button>
+    <a href="https://www.google.com/maps/search/?api=1&query=The+Settlement+Center+Borgarnes&query_place_id=ChIJHRm2HyDG1UgRjkAyOCA7Ogk" target="_blank" rel="noopener">📍 Google Maps</a>
+  </div>
+</div>
+
+<!-- ============ REYKJAVÍK ============ -->
+<h2><span class="roman">II</span>&nbsp;El puerto de Reykjavík</h2>
+
+<div class="stop" data-stop="5">
+  <div class="stop-head"><span class="shield city">1</span><span class="time">12:00</span><h3>Bæjarins Beztu Pylsur</h3>
+    <label class="card-pick"><input type="checkbox" class="pick" data-stop="5">Incluir</label></div>
+  <p><span class="label">QUÉ ES ·</span> un puesto callejero de panchos que funciona desde 1937 y es el más famoso del país.</p>
+  <p><span class="label">POR QUÉ IR ·</span> es la comida típica y barata de Reykjavík, en un país donde comer es carísimo. La salchicha es de cordero y se pide "con todo", con cebolla crocante y salsas locales. Es rápido, así que no les come tiempo del día.</p>
+  <div class="links">
+    <button data-focus="5">🗺️ Ver en el mapa</button>
+    <a href="https://maps.google.com/?cid=17195074179916053113" target="_blank" rel="noopener">📍 Google Maps</a>
+  </div>
+</div>
+
+<div class="stop" data-stop="6">
+  <div class="stop-head"><span class="shield city">2</span><span class="time">12:30</span><h3>Hallgrímskirkja</h3>
+    <label class="card-pick"><input type="checkbox" class="pick" data-stop="6">Incluir</label></div>
+  <p><span class="label">QUÉ ES ·</span> la iglesia más grande de Islandia, con una torre de 74 m que se ve desde toda la ciudad.</p>
+  <p><span class="label">POR QUÉ IR ·</span> es EL símbolo de Reykjavík. La fachada imita las columnas de basalto que se ven en la ruta, así que conecta con el paisaje del viaje. La torre tiene ascensor y da la mejor vista de la ciudad, algo que se disfruta sin esfuerzo físico.</p>
+  <div class="links">
+    <button data-focus="6">🗺️ Ver en el mapa</button>
+    <a href="https://maps.google.com/?cid=17847528671789558511" target="_blank" rel="noopener">📍 Google Maps</a>
+  </div>
+</div>
+
+<div class="stop" data-stop="7">
+  <div class="stop-head"><span class="shield city">3</span><span class="time">12:55</span><h3>Calle arcoíris (Skólavörðustígur)</h3>
+    <label class="card-pick"><input type="checkbox" class="pick" data-stop="7">Incluir</label></div>
+  <p><span class="label">QUÉ ES ·</span> el tramo de la calle Skólavörðustígur pintado con los colores del arcoíris, que baja desde Hallgrímskirkja hacia el centro. Se pintó para el Orgullo de Reykjavík y quedó como símbolo de la ciudad.</p>
+  <p><span class="label">POR QUÉ IR ·</span> es una de las fotos más lindas de Reykjavík: la calle de colores con la iglesia al fondo, rodeada de tiendas de lana, diseño y cafés. Queda a unos 5 minutos a pie en bajada desde la iglesia; como la vuelta es en subida, conviene que alguien busque el auto y los recoja abajo.</p>
+  <div class="links">
+    <button data-focus="7">🗺️ Ver en el mapa</button>
+    <a href="https://www.google.com/maps/search/?api=1&query=Sk%C3%B3lav%C3%B6r%C3%B0ust%C3%ADgur+Rainbow+Street&query_place_id=ChIJ3Sq5QJV11kgRh-e82xPZHVk" target="_blank" rel="noopener">📍 Google Maps</a>
+  </div>
+</div>
+
+<div class="stop" data-stop="8">
+  <div class="stop-head"><span class="shield city">4</span><span class="time">13:15</span><h3>Harpa</h3>
+    <label class="card-pick"><input type="checkbox" class="pick" data-stop="8">Incluir</label></div>
+  <p><span class="label">QUÉ ES ·</span> la sala de conciertos de la ciudad, un edificio de vidrio en forma de panal frente al puerto.</p>
+  <p><span class="label">POR QUÉ IR ·</span> es la arquitectura moderna más impactante del país y se recorre gratis. Adentro los reflejos de luz cambian todo el tiempo. Además tiene baños, café y asientos, ideal para una pausa antes de la ruta.</p>
+  <div class="links">
+    <button data-focus="8">🗺️ Ver en el mapa</button>
+    <a href="https://maps.google.com/?cid=13975404356062013019" target="_blank" rel="noopener">📍 Google Maps</a>
+  </div>
+</div>
+
+<div class="stop" data-stop="9">
+  <div class="stop-head"><span class="shield city">5</span><span class="time">13:30</span><h3>Sun Voyager</h3>
+    <label class="card-pick"><input type="checkbox" class="pick" data-stop="9">Incluir</label></div>
+  <p><span class="label">QUÉ ES ·</span> una escultura de acero con forma de barco vikingo estilizado, sobre la costanera.</p>
+  <p><span class="label">POR QUÉ IR ·</span> es la foto clásica de Reykjavík, con el mar y el monte Esja de fondo. Queda a pasos de Harpa, por un camino plano, así que se suma casi sin costo de tiempo.</p>
+  <div class="links">
+    <button data-focus="9">🗺️ Ver en el mapa</button>
+    <a href="https://maps.google.com/?cid=15599126036860413608" target="_blank" rel="noopener">📍 Google Maps</a>
+  </div>
+</div>
+
+<!-- ============ REYKJANES ============ -->
+<h2><span class="roman">III</span>&nbsp;Tierra de fuego: Reykjanes</h2>
+
+<div class="stop rey" data-stop="10">
+  <div class="stop-head"><span class="shield rey">6</span><span class="time">14:45</span><h3>Viking World</h3>
+    <label class="card-pick"><input type="checkbox" class="pick" data-stop="10">Incluir</label></div>
+  <p><span class="label">QUÉ ES ·</span> un museo (Víkingaheimar) con un barco vikingo real de 23 m que en el año 2000 navegó hasta América.</p>
+  <p><span class="label">POR QUÉ IR ·</span> poder subir a un barco vikingo de verdad es algo único, y el museo es tranquilo, bajo techo y sin caminatas largas. Además completa la historia del viaje: después de ver los paisajes, entienden quiénes llegaron a poblarlos.</p>
+  <span class="tag-warn">CIERRA A LAS 16:00</span>
+  <div class="links">
+    <button data-focus="10">🗺️ Ver en el mapa</button>
+    <a href="https://maps.google.com/?cid=5825045170254617226" target="_blank" rel="noopener">📍 Google Maps</a>
+  </div>
+</div>
+
+<div class="stop rey" data-stop="11">
+  <div class="stop-head"><span class="shield rey">7</span><span class="time">16:00</span><h3>Puente entre Continentes</h3>
+    <label class="card-pick"><input type="checkbox" class="pick" data-stop="11">Incluir</label></div>
+  <p><span class="label">QUÉ ES ·</span> un puente peatonal sobre la grieta que separa la placa tectónica de América del Norte de la de Europa.</p>
+  <p><span class="label">POR QUÉ IR ·</span> pocas veces se puede decir que cruzaste de un continente a otro caminando 15 metros. Es corto y fácil, y el camino atraviesa campos de lava con musgo muy lindos.</p>
+  <div class="links">
+    <button data-focus="11">🗺️ Ver en el mapa</button>
+    <a href="https://maps.google.com/?cid=6140454114928580297" target="_blank" rel="noopener">📍 Google Maps</a>
+  </div>
+</div>
+
+<div class="stop rey" data-stop="12">
+  <div class="stop-head"><span class="shield rey">8</span><span class="time">16:30</span><h3>Gunnuhver</h3>
+    <label class="card-pick"><input type="checkbox" class="pick" data-stop="12">Incluir</label></div>
+  <p><span class="label">QUÉ ES ·</span> la zona de aguas termales hirviendo más grande de Islandia.</p>
+  <p><span class="label">POR QUÉ IR ·</span> muestra la fuerza volcánica de la isla de la forma más cruda, con barro burbujeando, columnas de vapor y el ruido de la tierra "respirando". Se ve desde pasarelas cortas y es gratis. Suma el faro y los acantilados de fondo.</p>
+  <div class="links">
+    <button data-focus="12">🗺️ Ver en el mapa</button>
+    <a href="https://maps.google.com/?cid=6532231657481150589" target="_blank" rel="noopener">📍 Google Maps</a>
+  </div>
+</div>
+
+<div class="stop rey" data-stop="13">
+  <div class="stop-head"><span class="shield rey">9</span><span class="time">17:30</span><h3>Seltún</h3>
+    <label class="card-pick"><input type="checkbox" class="pick" data-stop="13">Incluir</label></div>
+  <p><span class="label">QUÉ ES ·</span> un campo geotérmico en Krýsuvík donde la tierra aparece pintada de rojo, amarillo y verde por los minerales.</p>
+  <p><span class="label">POR QUÉ IR ·</span> es el lugar más colorido del día, parece otro planeta. Tiene barro hirviendo y fumarolas que se recorren por pasarelas fáciles, y suele estar mucho menos lleno que los sitios más famosos.</p>
+  <div class="links">
+    <button data-focus="13">🗺️ Ver en el mapa</button>
+    <a href="https://maps.google.com/?cid=6366274195408286889" target="_blank" rel="noopener">📍 Google Maps</a>
+  </div>
+</div>
+
+<div class="stop rey" data-stop="14">
+  <div class="stop-head"><span class="shield rey">10</span><span class="time">18:00</span><h3>Kleifarvatn</h3>
+    <label class="card-pick"><input type="checkbox" class="pick" data-stop="14">Incluir</label></div>
+  <p><span class="label">QUÉ ES ·</span> un lago volcánico con playas de arena negra rodeado de montañas de lava.</p>
+  <p><span class="label">POR QUÉ IR ·</span> es un cierre tranquilo y casi lunar para el último día, y se disfruta desde el auto o el mirador. Queda al lado de Seltún, así que no hay que desviarse.</p>
+  <div class="links">
+    <button data-focus="14">🗺️ Ver en el mapa</button>
+    <a href="https://maps.google.com/?cid=7292813203440538889" target="_blank" rel="noopener">📍 Google Maps</a>
+  </div>
+</div>
+
+<!-- ============ PARTIDA ============ -->
+<h2><span class="roman">IV</span>&nbsp;La partida</h2>
+
+<div class="stop end" data-stop="15">
+  <div class="stop-head"><span class="shield end">✈</span><span class="time">19:30</span><h3>Aeropuerto de Keflavík</h3>
+    <label class="card-pick"><input type="checkbox" class="pick" data-stop="15">Incluir</label></div>
+  <p>A unos 50 minutos de Kleifarvatn. Devolución del auto, cena y vuelo de las 23:00, con margen de sobra.</p>
+  <div class="links">
+    <button data-focus="15">🗺️ Ver en el mapa</button>
+    <a href="https://www.google.com/maps/search/?api=1&query=Keflavik+International+Airport" target="_blank" rel="noopener">📍 Google Maps</a>
+  </div>
+</div>
+
+<footer>
+  <span class="runes">ᛟ ᚠ ᚢ ᚦ ᚨ ᚱ ᚲ ᛟ</span>
+  Horarios estimados sin paradas en el camino · revisar horarios de apertura el mismo día<br>
+  Mapa y ruta: © OpenStreetMap · OSRM
+</footer>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+(function () {
+  // on: si viene tildada por defecto (plan base)
+  var stops = [
+    { id: 0,  pin: 'S',  name: 'Arnarstapi (salida)',      g: 'end',  on: true,  lat: 64.7677,    lng: -23.6246,    dir: 'right' },
+    { id: 1,  pin: 'A',  name: 'Búðakirkja',               g: 'road', on: false, lat: 64.8216875, lng: -23.3840266, dir: 'top',    extra: 'iglesia negra · +20 min' },
+    { id: 2,  pin: 'B',  name: 'Ytri Tunga',               g: 'road', on: false, lat: 64.8027417, lng: -23.0803176, dir: 'bottom', extra: 'focas · +25 min' },
+    { id: 3,  pin: 'C',  name: 'Gerðuberg',                g: 'road', on: false, lat: 64.8577579, lng: -22.3673396, dir: 'top',    extra: 'basalto · +20 min' },
+    { id: 4,  pin: 'D',  name: 'Settlement Center',        g: 'road', on: false, lat: 64.5357437, lng: -21.9231548, dir: 'right',  extra: 'museo vikingo · +30–60 min' },
+    { id: 5,  pin: '1',  name: 'Bæjarins Beztu Pylsur',    g: 'city', on: true,  lat: 64.1481882, lng: -21.9378861, dir: 'left' },
+    { id: 6,  pin: '2',  name: 'Hallgrímskirkja',          g: 'city', on: true,  lat: 64.1420229, lng: -21.9265494, dir: 'bottom' },
+    { id: 7,  pin: '3',  name: 'Calle arcoíris',           g: 'city', on: true,  lat: 64.1460221, lng: -21.9325495, dir: 'left' },
+    { id: 8,  pin: '4',  name: 'Harpa',                    g: 'city', on: true,  lat: 64.1502464, lng: -21.9322805, dir: 'top' },
+    { id: 9,  pin: '5',  name: 'Sun Voyager',              g: 'city', on: true,  lat: 64.1476306, lng: -21.9222847, dir: 'right' },
+    { id: 10, pin: '6',  name: 'Viking World',             g: 'rey',  on: true,  lat: 63.9760214, lng: -22.529046,  dir: 'right' },
+    { id: 11, pin: '7',  name: 'Puente entre Continentes', g: 'rey',  on: true,  lat: 63.8683194, lng: -22.6755167, dir: 'left' },
+    { id: 12, pin: '8',  name: 'Gunnuhver',                g: 'rey',  on: true,  lat: 63.8192048, lng: -22.6845048, dir: 'bottom' },
+    { id: 13, pin: '9',  name: 'Seltún',                   g: 'rey',  on: true,  lat: 63.8957643, lng: -22.0548326, dir: 'left' },
+    { id: 14, pin: '10', name: 'Kleifarvatn',              g: 'rey',  on: true,  lat: 63.9257301, lng: -21.9715926, dir: 'right' },
+    { id: 15, pin: '✈',  name: 'Aeropuerto Keflavík',      g: 'end',  on: true,  lat: 63.985,     lng: -22.6056,    dir: 'left' }
+  ];
+  var GROUP_TITLES = { road: 'Camino (opcional)', city: 'Reykjavík', rey: 'Reykjanes', end: null };
+
+  // ---------- Selección ----------
+  var STORE_KEY = 'saga-islandia-seleccion-v2';
+  var sel = {};
+  function presetBase() { stops.forEach(function (s) { sel[s.id] = s.on; }); }
+  presetBase();
+  try {
+    var saved = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
+    if (saved) stops.forEach(function (s) { if (typeof saved[s.id] === 'boolean') sel[s.id] = saved[s.id]; });
+  } catch (e) {}
+
+  // Lista de tildes arriba del mapa
+  var list = document.getElementById('pick-list');
+  var lastGroup = null;
+  stops.forEach(function (s) {
+    var title = GROUP_TITLES[s.g];
+    if (title && s.g !== lastGroup) {
+      var gh = document.createElement('div');
+      gh.className = 'pick-group';
+      gh.textContent = title;
+      list.appendChild(gh);
+    } else if (!title && lastGroup !== null && lastGroup !== 'end') {
+      var gh2 = document.createElement('div');
+      gh2.className = 'pick-group';
+      gh2.textContent = 'Llegada';
+      list.appendChild(gh2);
+    } else if (!title && lastGroup === null) {
+      var gh3 = document.createElement('div');
+      gh3.className = 'pick-group';
+      gh3.textContent = 'Salida';
+      list.appendChild(gh3);
+    }
+    lastGroup = s.g;
+    var lab = document.createElement('label');
+    lab.className = 'pick-item';
+    lab.setAttribute('data-item', s.id);
+    lab.innerHTML = '<input type="checkbox" class="pick" data-stop="' + s.id + '">' +
+      '<span class="shield sm ' + s.g + '">' + s.pin + '</span>' +
+      '<span class="name">' + s.name + (s.extra ? '<span class="extra">' + s.extra + '</span>' : '') + '</span>';
+    list.appendChild(lab);
+  });
+
+  var picks = document.querySelectorAll('input.pick');
+
+  function selectedStops() { return stops.filter(function (s) { return sel[s.id]; }); }
+
+  function syncUI() {
+    for (var i = 0; i < picks.length; i++) picks[i].checked = !!sel[picks[i].getAttribute('data-stop')];
+    stops.forEach(function (s) {
+      var card = document.querySelector('.stop[data-stop="' + s.id + '"]');
+      if (card) card.classList.toggle('off', !sel[s.id]);
+      var item = document.querySelector('.pick-item[data-item="' + s.id + '"]');
+      if (item) item.classList.toggle('off', !sel[s.id]);
+    });
+    document.getElementById('count').textContent = '· ' + selectedStops().length + ' de ' + stops.length + ' elegidas';
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(sel)); } catch (e) {}
+  }
+
+  var apply = syncUI; // se reemplaza cuando el mapa carga
+
+  for (var i = 0; i < picks.length; i++) {
+    picks[i].addEventListener('change', function (e) {
+      sel[e.target.getAttribute('data-stop')] = e.target.checked;
+      apply();
+    });
+  }
+  document.getElementById('preset-base').addEventListener('click', function () { presetBase(); apply(); });
+  document.getElementById('all-on').addEventListener('click', function () {
+    stops.forEach(function (s) { sel[s.id] = true; }); apply();
+  });
+  document.getElementById('all-off').addEventListener('click', function () {
+    stops.forEach(function (s) { sel[s.id] = false; }); apply();
+  });
+
+  // ---------- Mapa ----------
+  var mapEl = document.getElementById('map');
+  var routeLegend = document.getElementById('route-legend');
+  if (typeof L === 'undefined') {
+    mapEl.innerHTML = '<p style="padding:16px">No se pudo cargar el mapa (hace falta conexión a internet). Los links a Google Maps de cada parada siguen funcionando.</p>';
+    routeLegend.style.display = 'none';
+    syncUI();
+    return;
+  }
+
+  var map = L.map('map', { scrollWheelZoom: false, tap: true });
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 18,
+    attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+
+  var markers = {};
+  var offsets = { left: [-18, 0], right: [18, 0], top: [0, -18], bottom: [0, 18] };
+
+  stops.forEach(function (s) {
+    var icon = L.divIcon({
+      className: 'pin',
+      html: '<div class="shield ' + s.g + '">' + s.pin + '</div>',
+      iconSize: [30, 30],
+      iconAnchor: [15, 15]
+    });
+    var m = L.marker([s.lat, s.lng], { icon: icon, zIndexOffset: 1000 + (s.g === 'city' ? 500 : 0) });
+    var label = (s.pin === 'S' || s.pin === '✈') ? s.name : s.pin + '. ' + s.name;
+    m.bindTooltip(label, { permanent: true, direction: s.dir, offset: offsets[s.dir], className: 'tag ' + s.g });
+    markers[s.id] = m;
+  });
+
+  var cityStops = stops.filter(function (s) { return s.g === 'city'; });
+  var cityGroup = L.tooltip({ permanent: true, direction: 'top', offset: [0, -20], className: 'tag group' })
+    .setLatLng([64.1465, -21.9300]);
+
+  function refreshLabels() {
+    var close = map.getZoom() >= 13;
+    var visibleCity = cityStops.filter(function (s) { return sel[s.id]; });
+    cityStops.forEach(function (s) {
+      var m = markers[s.id];
+      if (!map.hasLayer(m)) return;
+      if (close) m.openTooltip(); else m.closeTooltip();
+    });
+    if (!close && visibleCity.length) {
+      cityGroup.setContent('Reykjavík (' + visibleCity.map(function (s) { return s.pin; }).join(', ') + ')');
+      if (!map.hasLayer(cityGroup)) cityGroup.addTo(map);
+    } else if (map.hasLayer(cityGroup)) {
+      map.removeLayer(cityGroup);
+    }
+  }
+
+  // ---------- Ruta real ----------
+  var routers = [
+    'https://router.project-osrm.org/route/v1/driving/',
+    'https://routing.openstreetmap.de/routed-car/route/v1/driving/'
+  ];
+  var routeLayers = [];
+  var routeReq = 0;
+  var routeTimer = null;
+
+  function clearRoute() {
+    routeLayers.forEach(function (l) { map.removeLayer(l); });
+    routeLayers = [];
+  }
+
+  function drawFallback(pts) {
+    clearRoute();
+    routeLayers.push(L.polyline(pts.map(function (s) { return [s.lat, s.lng]; }), {
+      color: '#8b2e1f', weight: 3, opacity: .7, dashArray: '6 8', interactive: false
+    }).addTo(map));
+    routeLegend.innerHTML = '<i class="line fallback"></i>No se pudo trazar la ruta en auto: la línea marca solo el orden';
+  }
+
+  function drawRoute(route) {
+    clearRoute();
+    routeLayers.push(L.geoJSON(route.geometry, { style: { color: '#f5ecd6', weight: 8, opacity: .95 }, interactive: false }).addTo(map));
+    routeLayers.push(L.geoJSON(route.geometry, { style: { color: '#8b2e1f', weight: 4.5, opacity: .95 }, interactive: false }).addTo(map));
+    var km = Math.round(route.distance / 1000);
+    var mins = Math.round(route.duration / 60);
+    var h = Math.floor(mins / 60), m = mins % 60;
+    routeLegend.innerHTML = '<i class="line"></i>Ruta en auto: ' + km + ' km · ~' +
+      (h ? h + ' h ' : '') + (m < 10 && h ? '0' : '') + m + ' min de manejo';
+  }
+
+  function fetchRoute(pts, id, i) {
+    if (id !== routeReq) return;
+    if (i >= routers.length || !window.fetch) { drawFallback(pts); return; }
+    var ctrl = window.AbortController ? new AbortController() : null;
+    var t = setTimeout(function () { if (ctrl) ctrl.abort(); }, 12000);
+    var coords = pts.map(function (s) { return s.lng + ',' + s.lat; }).join(';');
+    fetch(routers[i] + coords + '?overview=full&geometries=geojson', ctrl ? { signal: ctrl.signal } : {})
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function (d) {
+        clearTimeout(t);
+        if (id !== routeReq) return;
+        if (d.code !== 'Ok' || !d.routes || !d.routes.length) throw new Error('sin ruta');
+        drawRoute(d.routes[0]);
+      })
+      .catch(function () { clearTimeout(t); fetchRoute(pts, id, i + 1); });
+  }
+
+  function scheduleRoute() {
+    clearTimeout(routeTimer);
+    var pts = selectedStops();
+    var id = ++routeReq;
+    if (pts.length < 2) {
+      clearRoute();
+      routeLegend.innerHTML = '<i class="line fallback"></i>Elegí al menos dos paradas para trazar la ruta';
+      return;
+    }
+    routeLegend.innerHTML = '<i class="line"></i>Trazando la ruta…';
+    routeTimer = setTimeout(function () { fetchRoute(pts, id, 0); }, 350);
+  }
+
+  // ---------- Vistas ----------
+  var viewBtns = document.querySelectorAll('.map-bar .btn');
+  function ptsFor(view) {
+    var pool = stops.filter(function (s) {
+      if (view === 'road') return s.g === 'road' || s.id === 0 || s.id === 5;
+      if (view === 'city') return s.g === 'city';
+      if (view === 'rey') return s.g === 'rey' || s.id === 15;
+      return true;
+    });
+    var chosen = pool.filter(function (s) { return sel[s.id]; });
+    return (chosen.length ? chosen : pool).map(function (s) { return [s.lat, s.lng]; });
+  }
+  function setView(view) {
+    var pts = ptsFor(view);
+    if (pts.length === 1) map.setView(pts[0], 14);
+    else map.fitBounds(pts, { padding: view === 'city' ? [60, 60] : [40, 40] });
+    for (var i = 0; i < viewBtns.length; i++) viewBtns[i].classList.toggle('active', viewBtns[i].getAttribute('data-view') === view);
+  }
+
+  // ---------- Aplicar selección ----------
+  apply = function () {
+    syncUI();
+    stops.forEach(function (s) {
+      var m = markers[s.id];
+      if (sel[s.id] && !map.hasLayer(m)) m.addTo(map);
+      if (!sel[s.id] && map.hasLayer(m)) map.removeLayer(m);
+    });
+    refreshLabels();
+    scheduleRoute();
+  };
+
+  map.on('zoomend', refreshLabels);
+  setView('all');
+  apply();
+
+  for (var v = 0; v < viewBtns.length; v++) {
+    viewBtns[v].addEventListener('click', function (e) { setView(e.currentTarget.getAttribute('data-view')); });
+  }
+
+  var focusBtns = document.querySelectorAll('[data-focus]');
+  for (var f = 0; f < focusBtns.length; f++) {
+    focusBtns[f].addEventListener('click', function (e) {
+      var s = stops[parseInt(e.currentTarget.getAttribute('data-focus'), 10)];
+      if (!sel[s.id]) { sel[s.id] = true; apply(); }
+      document.getElementById('mapa').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      map.setView([s.lat, s.lng], 15);
+      for (var i = 0; i < viewBtns.length; i++) viewBtns[i].classList.remove('active');
+    });
+  }
+})();
+</script>
+</body>
+</html>
